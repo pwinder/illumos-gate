@@ -371,6 +371,7 @@ DRV_KMODS	+= pppt
 DRV_KMODS	+= iptun
 DRV_KMODS	+= vmxnet3s
 DRV_KMODS	+= pvscsi
+DRV_KMODS	+= smartpqi
 
 #
 # Common code drivers
@@ -449,7 +450,6 @@ DRV_KMODS	+= fcsm
 DRV_KMODS	+= fp
 DRV_KMODS	+= qlc
 DRV_KMODS	+= iscsi
-
 #
 #	PCMCIA specific module(s)
 #
