@@ -4309,6 +4309,7 @@ nvme_ioctl_detach(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
     cred_t *cred_p)
 {
 	_NOTE(ARGUNUSED(nioc, mode));
+	nvme_minor_state_t *nm;
 	int rv = 0;
 
 	if ((mode & FWRITE) == 0 || secpolicy_sys_config(cred_p, B_FALSE) != 0)
@@ -4317,9 +4318,14 @@ nvme_ioctl_detach(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
 	if (nsid == 0)
 		return (EINVAL);
 
+	nm = &nvme->n_ns[nsid - 1].ns_minor;
+	mutex_enter(&nm->nm_mutex);
+
 	rv = bd_detach_handle(nvme->n_ns[nsid - 1].ns_bd_hdl);
 	if (rv != DDI_SUCCESS)
 		rv = EBUSY;
+
+	mutex_exit(&nm->nm_mutex);
 
 	return (rv);
 }
@@ -4330,6 +4336,7 @@ nvme_ioctl_attach(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
 {
 	_NOTE(ARGUNUSED(nioc, mode));
 	nvme_identify_nsid_t *idns;
+	nvme_minor_state_t *nm;
 	int rv = 0;
 
 	if ((mode & FWRITE) == 0 || secpolicy_sys_config(cred_p, B_FALSE) != 0)
@@ -4338,18 +4345,25 @@ nvme_ioctl_attach(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
 	if (nsid == 0)
 		return (EINVAL);
 
+	nm = &nvme->n_ns[nsid - 1].ns_minor;
+	mutex_enter(&nm->nm_mutex);
+
 	/*
 	 * Identify namespace again, free old identify data.
 	 */
 	idns = nvme->n_ns[nsid - 1].ns_idns;
-	if (nvme_init_ns(nvme, nsid) != DDI_SUCCESS)
+	if (nvme_init_ns(nvme, nsid) != DDI_SUCCESS) {
+		mutex_exit(&nm->nm_mutex);
 		return (EIO);
+	}
 
 	kmem_free(idns, sizeof (nvme_identify_nsid_t));
 
 	rv = bd_attach_handle(nvme->n_dip, nvme->n_ns[nsid - 1].ns_bd_hdl);
 	if (rv != DDI_SUCCESS)
 		rv = EBUSY;
+
+	mutex_exit(&nm->nm_mutex);
 
 	return (rv);
 }
