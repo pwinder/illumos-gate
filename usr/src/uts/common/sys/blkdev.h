@@ -23,6 +23,7 @@
  * Copyright 2016 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2019 Western Digital Corporation.
+ * Copyright 2019 Unix Software Ltd.
  */
 
 #ifndef	_SYS_BLKDEV_H
@@ -203,6 +204,7 @@ void		bd_free_handle(bd_handle_t);
 int		bd_attach_handle(dev_info_t *, bd_handle_t);
 int		bd_detach_handle(bd_handle_t);
 void		bd_state_change(bd_handle_t);
+void		bd_device_info_change(bd_handle_t);
 void		bd_xfer_done(bd_xfer_t *, int);
 void		bd_error(bd_xfer_t *, int);
 void		bd_mod_init(struct dev_ops *);

@@ -25,6 +25,7 @@
  * Copyright 2016 Nexenta Systems, Inc.  All rights reserved.
  * Copyright 2017 The MathWorks, Inc.  All rights reserved.
  * Copyright 2019 Western Digital Corporation.
+ * Copyright 2019 Unix Software Ltd.
  */
 
 #include <sys/types.h>
@@ -1761,6 +1762,51 @@ bd_runq_exit(bd_xfer_impl_t *xi, int err)
 		}
 	}
 	bd_sched(bd, bq);
+}
+
+void
+bd_device_info_change(bd_handle_t hdl)
+{
+	bd_t		*bd = hdl->h_bd;
+	bd_drive_t	drive;
+	bd_queue_t	*bq;
+	boolean_t	sched = B_FALSE;
+	int		i;
+
+	if (bd == NULL)
+		return;
+
+	/*
+	 * Gather the latest drive_info.
+	 * At the moment we only check whether the d_qsize has changed
+	 * and modify accordingly. In the future this entry point could
+	 * be used to change other attributes.
+	 */
+	drive.d_qcount = 1;
+	bd->d_ops.o_drive_info(bd->d_private, &drive);
+
+	ASSERT(bd->d_qcount == drive.d_qcount);
+
+	for (i = 0; i < bd->d_qcount; i++) {
+		bq = &bd->d_queues[i];
+
+		mutex_enter(&bq->q_iomutex);
+		if (bq->q_qsize != drive.d_qsize) {
+			sched = sched || drive.d_qsize > bq->q_qsize;
+			bq->q_qsize = drive.d_qsize;
+		}
+		mutex_exit(&bq->q_iomutex);
+	}
+
+	if (!sched)
+		return;
+
+	/*
+	 * If the qsize has increased, give them a kick in case there was
+	 * anything pending.
+	 */
+	for (i = 0; i < bd->d_qcount; i++)
+		bd_sched(bd, &bd->d_queues[i]);
 }
 
 static void

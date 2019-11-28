@@ -12,6 +12,7 @@
 /*
  * Copyright 2016 Nexenta Systems, Inc.
  * Copyright 2019 Western Digital Corporation
+ * Copyright 2019 Unix Software Ltd.
  */
 
 #ifndef _NVMEADM_H
@@ -33,7 +34,7 @@ extern void nvme_print(int, char *, int, const char *, ...);
 extern void nvme_print_ctrl_summary(nvme_identify_ctrl_t *, nvme_version_t *);
 extern void nvme_print_nsid_summary(nvme_identify_nsid_t *);
 extern void nvme_print_identify_ctrl(nvme_identify_ctrl_t *,
-    nvme_capabilities_t *, nvme_version_t *);
+    nvme_capabilities_t *, nvme_identify_nsid_t *, nvme_version_t *);
 extern void nvme_print_identify_nsid(nvme_identify_nsid_t *, nvme_version_t *);
 extern void nvme_print_error_log(int, nvme_error_log_entry_t *);
 extern void nvme_print_health_log(nvme_health_log_t *, nvme_identify_ctrl_t *);
@@ -82,7 +83,9 @@ extern boolean_t nvme_format_nvm(int, uint8_t, uint8_t);
 extern boolean_t nvme_detach(int);
 extern boolean_t nvme_attach(int);
 extern boolean_t nvme_firmware_load(int, void *, size_t, offset_t);
-extern boolean_t nvme_firmware_commit(int fd, int, int, uint16_t *, uint16_t *);
+extern boolean_t nvme_firmware_commit(int, int, int, uint16_t *, uint16_t *);
+extern boolean_t nvme_namespace_create(int, uint64_t, uint_t, uint_t *);
+extern boolean_t nvme_namespace_delete(int);
 
 #ifdef __cplusplus
 }

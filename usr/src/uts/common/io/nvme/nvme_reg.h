@@ -13,6 +13,7 @@
  * Copyright 2016 Nexenta Systems, Inc. All rights reserved.
  * Copyright (c) 2018, Joyent, Inc.
  * Copyright 2019 Western Digital Corporation
+ * Copyright 2019 Unix Software Ltd.
  */
 
 /*
@@ -422,6 +423,20 @@ typedef union {
 	uint32_t r;
 } nvme_getlogpage_t;
 
+/*
+ * NVMe Namespace Management
+ */
+typedef union {
+	struct {
+		uint8_t nm_sel:4;
+		uint8_t :4;
+		uint8_t nm_rsvd[3];
+	} b;
+	uint32_t r;
+} nvme_ns_management_t;
+
+#define	NVME_NS_MGMT_CREATE	0x0	/* Namespace Create */
+#define	NVME_NS_MGMT_DELETE	0x1	/* Namespace Delete */
 
 #ifdef __cplusplus
 }

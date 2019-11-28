@@ -15,6 +15,7 @@
  * Copyright (c) 2016 The MathWorks, Inc.  All rights reserved.
  * Copyright 2018 Joyent, Inc.
  * Copyright 2019 Western Digital Corporation.
+ * Copyright 2019 Unix Software Ltd.
  * Copyright 2020 Racktop Systems.
  */
 
@@ -1534,6 +1535,15 @@ nvme_check_specific_cmd_status(nvme_cmd_t *cmd)
 		ASSERT(cmd->nc_sqe.sqe_opc == NVME_OPC_FW_IMAGE_LOAD);
 		return (EINVAL);
 
+	case NVME_CQE_SC_SPC_NS_CAPACITY:
+		/* Insufficient Namespace Capacity */
+		ASSERT(cmd->nc_sqe.sqe_opc == NVME_OPC_NS_MGMT);
+		return (ENOSPC);
+
+	case NVME_CQE_SC_SPC_NS_IDENT:
+		/* Namespace Identifier Unavailable */
+		ASSERT(cmd->nc_sqe.sqe_opc == NVME_OPC_NS_MGMT);
+		return (ENODEV);
 	default:
 		return (nvme_check_unknown_cmd_status(cmd));
 	}
@@ -2295,6 +2305,35 @@ nvme_write_cache_set(nvme_t *nvme, boolean_t enable)
 }
 
 static int
+nvme_namespace_delete(nvme_t *nvme, int ns_id)
+{
+	nvme_cmd_t *cmd = nvme_alloc_cmd(nvme, KM_SLEEP);
+	nvme_ns_management_t nsm = { 0 };
+	int ret;
+
+	cmd->nc_sqid = 0;
+	cmd->nc_callback = nvme_wakeup_cmd;
+	cmd->nc_sqe.sqe_opc = NVME_OPC_NS_MGMT;
+	cmd->nc_sqe.sqe_nsid = ns_id;
+
+	nsm.b.nm_sel = NVME_NS_MGMT_DELETE;
+	cmd->nc_sqe.sqe_cdw10 = nsm.r;
+	cmd->nc_dontpanic = B_TRUE;
+
+	nvme_admin_cmd(cmd, nvme_admin_cmd_timeout);
+
+	if ((ret = nvme_check_cmd_status(cmd)) != 0) {
+		dev_err(nvme->n_dip, CE_WARN, "!Namespace delete for ns_id %d "
+		    "failed with sct = 0x%x, sc = 0x%x", ns_id,
+		    cmd->nc_cqe.cqe_sf.sf_sct, cmd->nc_cqe.cqe_sf.sf_sc);
+	}
+
+	nvme_free_cmd(cmd);
+
+	return (ret);
+}
+
+static int
 nvme_set_nqueues(nvme_t *nvme)
 {
 	nvme_nqueues_t nq = { 0 };
@@ -2520,6 +2559,9 @@ nvme_init_ns(nvme_t *nvme, int nsid)
 
 	ns->ns_nvme = nvme;
 
+	ASSERT((nvme->n_progress & NVME_MGMT_INIT) == 0 ||
+	    MUTEX_HELD(&nvme->n_mgmt_mutex));
+
 	if (nvme_identify(nvme, B_FALSE, nsid, (void **)&idns) != 0) {
 		dev_err(nvme->n_dip, CE_WARN,
 		    "!failed to identify namespace %d", nsid);
@@ -2615,6 +2657,85 @@ nvme_init_ns(nvme_t *nvme, int nsid)
 	}
 
 	return (DDI_SUCCESS);
+}
+
+static void
+nvme_fini_ns(nvme_t *nvme, int nsid)
+{
+	nvme_namespace_t *ns = &nvme->n_ns[nsid - 1];
+
+	ASSERT(MUTEX_HELD(&nvme->n_mgmt_mutex));
+
+	if (ns->ns_ignore)
+		return;
+
+	ns->ns_ignore = B_TRUE;
+	ns->ns_block_count = 0;
+	ns->ns_block_size = 1;
+	nvme->n_namespaces_attachable--;
+}
+
+static int
+nvme_attach_ns(nvme_t *nvme, int nsid)
+{
+	nvme_namespace_t *ns = &nvme->n_ns[nsid - 1];
+	nvme_identify_nsid_t *idns;
+
+	ASSERT(MUTEX_HELD(&nvme->n_mgmt_mutex));
+
+	/*
+	 * Identify namespace, free old identify data.
+	 */
+	idns = ns->ns_idns;
+	if (nvme_init_ns(nvme, nsid) != DDI_SUCCESS)
+		return (EIO);
+
+	if (idns)
+		kmem_free(idns, sizeof (nvme_identify_nsid_t));
+
+	if (ns->ns_bd_hdl == NULL) {
+		ns->ns_bd_hdl = bd_alloc_handle(ns, &nvme_bd_ops,
+		    &nvme->n_prp_dma_attr, KM_SLEEP);
+
+		if (ns->ns_bd_hdl == NULL) {
+			dev_err(nvme->n_dip, CE_WARN, "!Failed to get blkdev "
+			    "handle for namespace id %d", nsid);
+			return (EINVAL);
+		}
+	}
+
+	if (bd_attach_handle(nvme->n_dip, ns->ns_bd_hdl) != DDI_SUCCESS)
+		return (EBUSY);
+
+	ns->ns_attached = B_TRUE;
+
+	return (0);
+}
+
+/*
+ * Called if the number of attachable namespaces may have changed.
+ * It will prod blkdev to refresh the drive info for the other namespaces
+ * and adjust any queue size should they have changed.
+ */
+static void
+nvme_resize_queues(nvme_t *nvme, uint_t nsid)
+{
+	nvme_namespace_t *ns;
+	int i;
+
+	ASSERT(MUTEX_HELD(&nvme->n_mgmt_mutex));
+
+	for (i = 0; i < nvme->n_namespace_count; i++) {
+		if (i == nsid - 1)
+			continue;
+
+		ns = &nvme->n_ns[i];
+
+		if (ns->ns_ignore || !ns->ns_attached)
+			continue;
+
+		bd_device_info_change(ns->ns_bd_hdl);
+	}
 }
 
 static int
@@ -3432,13 +3553,18 @@ nvme_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ddi_ufm_update(nvme->n_ufmh);
 	nvme->n_progress |= NVME_UFM_INIT;
 
+	mutex_init(&nvme->n_mgmt_mutex, NULL, MUTEX_DRIVER, NULL);
+	nvme->n_progress |= NVME_MGMT_INIT;
+
 	/*
 	 * Attach the blkdev driver for each namespace.
 	 */
+	mutex_enter(&nvme->n_mgmt_mutex);
 	for (i = 0; i != nvme->n_namespace_count; i++) {
 		if (ddi_create_minor_node(nvme->n_dip, nvme->n_ns[i].ns_name,
 		    S_IFCHR, NVME_MINOR(ddi_get_instance(nvme->n_dip), i + 1),
 		    DDI_NT_NVME_ATTACHMENT_POINT, 0) != DDI_SUCCESS) {
+			mutex_exit(&nvme->n_mgmt_mutex);
 			dev_err(dip, CE_WARN,
 			    "!failed to create minor node for namespace %d", i);
 			goto fail;
@@ -3451,6 +3577,7 @@ nvme_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		    &nvme_bd_ops, &nvme->n_prp_dma_attr, KM_SLEEP);
 
 		if (nvme->n_ns[i].ns_bd_hdl == NULL) {
+			mutex_exit(&nvme->n_mgmt_mutex);
 			dev_err(dip, CE_WARN,
 			    "!failed to get blkdev handle for namespace %d", i);
 			goto fail;
@@ -3458,12 +3585,15 @@ nvme_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 		if (bd_attach_handle(dip, nvme->n_ns[i].ns_bd_hdl)
 		    != DDI_SUCCESS) {
+			mutex_exit(&nvme->n_mgmt_mutex);
 			dev_err(dip, CE_WARN,
 			    "!failed to attach blkdev handle for namespace %d",
 			    i);
 			goto fail;
 		}
+		nvme->n_ns[i].ns_attached = B_TRUE;
 	}
+	mutex_exit(&nvme->n_mgmt_mutex);
 
 	if (ddi_create_minor_node(dip, "devctl", S_IFCHR,
 	    NVME_MINOR(ddi_get_instance(dip), 0), DDI_NT_NVME_NEXUS, 0)
@@ -3525,6 +3655,10 @@ nvme_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 		kmem_free(nvme->n_ns, sizeof (nvme_namespace_t) *
 		    nvme->n_namespace_count);
 	}
+
+	if (nvme->n_progress & NVME_MGMT_INIT)
+		mutex_destroy(&nvme->n_mgmt_mutex);
+
 	if (nvme->n_progress & NVME_UFM_INIT) {
 		ddi_ufm_fini(nvme->n_ufmh);
 		mutex_destroy(&nvme->n_fwslot_mutex);
@@ -4045,6 +4179,8 @@ nvme_ioc_cmd(nvme_t *nvme, nvme_sqe_t *sqe, boolean_t is_admin, void *data_addr,
 
 	cmd->nc_callback = nvme_wakeup_cmd;
 	cmd->nc_sqe = *sqe;
+	/* An ioctl should never cause a panic ... */
+	cmd->nc_dontpanic = B_TRUE;
 
 	if ((rwk & (FREAD | FWRITE)) != 0) {
 		if (data_addr == NULL) {
@@ -4365,6 +4501,9 @@ nvme_ioctl_format(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
 	if ((mode & FWRITE) == 0 || secpolicy_sys_config(cred_p, B_FALSE) != 0)
 		return (EPERM);
 
+	if (nvme->n_idctl->id_oacs.oa_format == 0)
+		return (ENOTSUP);
+
 	frmt.r = nioc->n_arg & 0xffffffff;
 
 	/*
@@ -4426,9 +4565,17 @@ nvme_ioctl_detach(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
 	if (nsid == 0)
 		return (EINVAL);
 
-	rv = bd_detach_handle(nvme->n_ns[nsid - 1].ns_bd_hdl);
-	if (rv != DDI_SUCCESS)
-		rv = EBUSY;
+	mutex_enter(&nvme->n_mgmt_mutex);
+
+	if (!nvme->n_ns[nsid - 1].ns_ignore) {
+		rv = bd_detach_handle(nvme->n_ns[nsid - 1].ns_bd_hdl);
+		if (rv != DDI_SUCCESS)
+			rv = EBUSY;
+		else
+			nvme->n_ns[nsid - 1].ns_attached = B_FALSE;
+	}
+
+	mutex_exit(&nvme->n_mgmt_mutex);
 
 	return (rv);
 }
@@ -4438,8 +4585,7 @@ nvme_ioctl_attach(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
     cred_t *cred_p)
 {
 	_NOTE(ARGUNUSED(nioc, mode));
-	nvme_identify_nsid_t *idns;
-	int rv = 0;
+	int rv;
 
 	if ((mode & FWRITE) == 0 || secpolicy_sys_config(cred_p, B_FALSE) != 0)
 		return (EPERM);
@@ -4447,18 +4593,107 @@ nvme_ioctl_attach(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
 	if (nsid == 0)
 		return (EINVAL);
 
-	/*
-	 * Identify namespace again, free old identify data.
-	 */
-	idns = nvme->n_ns[nsid - 1].ns_idns;
-	if (nvme_init_ns(nvme, nsid) != DDI_SUCCESS)
-		return (EIO);
+	mutex_enter(&nvme->n_mgmt_mutex);
 
-	kmem_free(idns, sizeof (nvme_identify_nsid_t));
+	rv = nvme->n_ns[nsid - 1].ns_ignore ? ENOTSUP :
+	    nvme_attach_ns(nvme, nsid);
 
-	rv = bd_attach_handle(nvme->n_dip, nvme->n_ns[nsid - 1].ns_bd_hdl);
-	if (rv != DDI_SUCCESS)
-		rv = EBUSY;
+	if (rv == 0)
+		nvme_resize_queues(nvme, nsid);
+
+	mutex_exit(&nvme->n_mgmt_mutex);
+
+	return (rv);
+}
+
+static int
+nvme_ioctl_ns_create(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
+    cred_t *cred_p)
+{
+	nvme_ns_management_t nsm = { 0 };
+	nvme_cqe_t cqe;
+	nvme_sqe_t sqe = {
+	    .sqe_opc	= NVME_OPC_NS_MGMT
+	};
+	int rv;
+
+	if ((mode & FWRITE) == 0 || secpolicy_sys_config(cred_p, B_FALSE) != 0)
+		return (EPERM);
+
+	if (nvme->n_idctl->id_oacs.oa_ns_mgmt == 0)
+		return (ENOTSUP);
+
+	if (nsid != 0)
+		return (EINVAL);
+
+	if (nioc->n_len != sizeof (nvme_namespace_create_t))
+		return (EINVAL);
+
+	nsm.b.nm_sel = NVME_NS_MGMT_CREATE;
+	sqe.sqe_cdw10 = nsm.r;
+
+	rv = nvme_ioc_cmd(nvme, &sqe, B_TRUE, (void *)nioc->n_buf, nioc->n_len,
+	    FWRITE, &cqe, nvme_admin_cmd_timeout);
+
+	if (rv == 0) {
+		nsid = (int)cqe.cqe_dw0;
+		nioc->n_arg = nsid;
+
+		mutex_enter(&nvme->n_mgmt_mutex);
+
+		nvme->n_ns[nsid - 1].ns_ignore = B_TRUE;
+		rv = nvme_attach_ns(nvme, nsid);
+		if (rv == 0)
+			nvme_resize_queues(nvme, nsid);
+
+		mutex_exit(&nvme->n_mgmt_mutex);
+	}
+
+	return (rv);
+}
+
+static int
+nvme_ioctl_ns_delete(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc, int mode,
+    cred_t *cred_p)
+{
+	int rv, i;
+
+	if ((mode & FWRITE) == 0 || secpolicy_sys_config(cred_p, B_FALSE) != 0)
+		return (EPERM);
+
+	if (nvme->n_idctl->id_oacs.oa_ns_mgmt == 0)
+		return (ENOTSUP);
+
+	mutex_enter(&nvme->n_mgmt_mutex);
+
+	if (nsid == 0) {
+		for (i = 0; i < nvme->n_namespace_count; i++) {
+			if (nvme->n_ns[i].ns_attached) {
+				mutex_exit(&nvme->n_mgmt_mutex);
+				return (EBUSY);
+			}
+		}
+
+		rv = nvme_namespace_delete(nvme, ~0);
+
+		if (rv == 0) {
+			for (i = 1; i <= nvme->n_namespace_count; i++)
+				nvme_fini_ns(nvme, i);
+		}
+	} else {
+		if (nvme->n_ns[nsid - 1].ns_ignore) {
+			rv = 0;
+		} else if (nvme->n_ns[nsid - 1].ns_attached) {
+			rv = EBUSY;
+		} else if ((rv = nvme_namespace_delete(nvme, nsid)) == 0) {
+			nvme_fini_ns(nvme, nsid);
+		}
+
+		if (rv == 0)
+			nvme_resize_queues(nvme, nsid);
+	}
+
+	mutex_exit(&nvme->n_mgmt_mutex);
 
 	return (rv);
 }
@@ -4489,6 +4724,9 @@ nvme_ioctl_firmware_download(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc,
 
 	if ((mode & FWRITE) == 0 || secpolicy_sys_config(cred_p, B_FALSE) != 0)
 		return (EPERM);
+
+	if (nvme->n_idctl->id_oacs.oa_firmware == 0)
+		return (ENOTSUP);
 
 	if (nsid != 0)
 		return (EINVAL);
@@ -4550,8 +4788,13 @@ nvme_ioctl_firmware_commit(nvme_t *nvme, int nsid, nvme_ioctl_t *nioc,
 	int timeout;
 	int rv;
 
+	nioc->n_arg = 0;
+
 	if ((mode & FWRITE) == 0 || secpolicy_sys_config(cred_p, B_FALSE) != 0)
 		return (EPERM);
+
+	if (nvme->n_idctl->id_oacs.oa_firmware == 0)
+		return (ENOTSUP);
 
 	if (nsid != 0)
 		return (EINVAL);
@@ -4616,7 +4859,9 @@ nvme_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cred_p,
 		nvme_ioctl_detach,
 		nvme_ioctl_attach,
 		nvme_ioctl_firmware_download,
-		nvme_ioctl_firmware_commit
+		nvme_ioctl_firmware_commit,
+		nvme_ioctl_ns_create,
+		nvme_ioctl_ns_delete
 	};
 
 	if (nvme == NULL)
@@ -4662,10 +4907,12 @@ nvme_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cred_p,
 		nsid = 0;
 	} else if (cmd == NVME_IOC_IDENTIFY_NSID && nsid == 0) {
 		/*
-		 * This makes NVME_IOC_IDENTIFY_NSID work on a devctl node, it
-		 * will always return identify data for namespace 1.
+		 * If we support namespace management, set the nsid to -1 to
+		 * retrieve the common namespace capabilites. Otherwise
+		 * have a best guess by returning identify data for namespace
+		 * 1.
 		 */
-		nsid = 1;
+		nsid = nvme->n_idctl->id_oacs.oa_ns_mgmt == 1 ? -1 : 1;
 	}
 
 	if (IS_NVME_IOC(cmd) && nvme_ioctl[NVME_IOC_CMD(cmd)] != NULL)

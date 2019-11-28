@@ -60,6 +60,16 @@
 .Ar ctl[/ns]
 .Nm
 .Op Fl dv
+.Cm create
+.Ar ctl
+.Ar size
+.Ar block-size
+.Nm
+.Op Fl dv
+.Cm delete
+.Ar ctl[/ns]
+.Nm
+.Op Fl dv
 .Cm load-firmware
 .Ar ctl
 .Ar firmware-file
@@ -148,6 +158,23 @@ command.
 The list of supported LBA formats on a namespace can be retrieved
 with the
 .Nm
+.Cm identify
+command.
+.It Ar size
+Specifies the size of the namespace to create.
+By default
+.Ar size
+is the size in bytes, but a scaling suffix can be appended to
+.Ar size :
+[bB] for blocks in
+.Ar block-size
+units, [kK] for kilobytes, [mM] for megabytes or [gG] for gigabytes.
+.It Ar block-size
+Specifies the block size to use when creating a namespace.
+The
+.Ar block-size
+must be a size from the list of supported block sizes retrieved
+using the
 .Cm identify
 command.
 .It Ar firmware-file
@@ -344,6 +371,31 @@ previous
 .Nm
 .Cm detach
 command.
+.It Xo
+.Nm
+.Cm create
+.Ar ctl
+.Ar size
+.Ar block-size
+.Xc
+Providing there is sufficient spare capacity,
+.Cm create
+will create and attach a new namespace in the controller.
+.It Xo
+.Nm
+.Cm delete
+.Ar ctl[/ns]
+.Xc
+When just
+.Ar ctl
+is specified the command will attempt to delete all the namespaces in
+the controller. Add
+.Ar ns
+to delete a specific namespace.
+A namespace can not be deleted whilst it is in use,
+.Nm
+.Cm detach
+must be used to detach the namespace before it can be deleted.
 .It Xo
 .Nm
 .Cm load-firmware

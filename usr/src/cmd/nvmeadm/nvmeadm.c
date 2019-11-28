@@ -13,6 +13,7 @@
  * Copyright 2016 Nexenta Systems, Inc.
  * Copyright 2017 Joyent, Inc.
  * Copyright 2019 Western Digital Corporation.
+ * Copyright 2019 Unix Software Ltd.
  */
 
 /*
@@ -27,6 +28,8 @@
  *		secure-erase ...
  *		detach ...
  *		attach ...
+ *		create ...
+ *		delete ...
  *		get-param ...
  *		set-param ...
  *		load-firmware ...
@@ -116,6 +119,8 @@ static int do_attach_detach(int, const nvme_process_arg_t *);
 static int do_firmware_load(int, const nvme_process_arg_t *);
 static int do_firmware_commit(int, const nvme_process_arg_t *);
 static int do_firmware_activate(int, const nvme_process_arg_t *);
+static int do_namespace_create(int, const nvme_process_arg_t *);
+static int do_namespace_delete(int, const nvme_process_arg_t *);
 
 static void usage_list(const char *);
 static void usage_identify(const char *);
@@ -127,6 +132,8 @@ static void usage_attach_detach(const char *);
 static void usage_firmware_load(const char *);
 static void usage_firmware_commit(const char *);
 static void usage_firmware_activate(const char *);
+static void usage_namespace_create(const char *);
+static void usage_namespace_delete(const char *);
 
 int verbose;
 int debug;
@@ -180,6 +187,18 @@ static const nvmeadm_cmd_t nvmeadm_cmds[] = {
 		"attach blkdev(7d) to namespace(s) of a controller",
 		NULL,
 		do_attach_detach, usage_attach_detach, B_FALSE
+	},
+	{
+		"create",
+		"create a namespace in a controller",
+		NULL,
+		do_namespace_create, usage_namespace_create, B_FALSE
+	},
+	{
+		"delete",
+		"delete a single or all namespaces in a controller",
+		NULL,
+		do_namespace_delete, usage_namespace_delete, B_FALSE
 	},
 	{
 		"load-firmware",
@@ -628,7 +647,7 @@ do_identify(int fd, const nvme_process_arg_t *npa)
 			return (-1);
 
 		(void) printf("%s: ", npa->npa_name);
-		nvme_print_identify_ctrl(npa->npa_idctl, cap,
+		nvme_print_identify_ctrl(npa->npa_idctl, cap, npa->npa_idns,
 		    npa->npa_version);
 
 		free(cap);
@@ -1192,7 +1211,8 @@ do_firmware_commit(int fd, const nvme_process_arg_t *npa)
 
 	if (!nvme_firmware_commit(fd, slot, NVME_FWC_SAVE, &sct, &sc))
 		errx(-1, "Failed to commit firmware to slot %u: %s",
-		    slot, nvme_str_error(sct, sc));
+		    slot, sct == 0 && sc == 0 ? strerror(errno) :
+		    nvme_str_error(sct, sc));
 
 	if (verbose)
 		(void) printf("Firmware committed to slot %u.\n", slot);
@@ -1225,11 +1245,167 @@ do_firmware_activate(int fd, const nvme_process_arg_t *npa)
 
 	if (!nvme_firmware_commit(fd, slot, NVME_FWC_ACTIVATE, &sct, &sc))
 		errx(-1, "Failed to activate slot %u: %s", slot,
+		    sct == 0 && sc == 0 ? strerror(errno) :
 		    nvme_str_error(sct, sc));
 
 	if (verbose)
 		printf("Slot %u activated: %s.\n", slot,
 		    nvme_str_error(sct, sc));
+
+	return (0);
+}
+
+static void
+usage_namespace_create(const char *c_name)
+{
+	(void) fprintf(stderr, "%s <ctl> <size> <block size>\n\n"
+	    "  Create a namespace of <size> formatted with <block size>.\n"
+	    "  <size> can be optionally suffixed with one of [bBkKmMgG] to "
+	    "indicate\n"
+	    "    either blocks, kilobytes, megabytes or gigabytes.\n"
+	    "  <block size> must be a supported block size as shown using the "
+	    "\"identify\"\n    subcommand.\n",
+	    c_name);
+}
+
+static uint64_t
+get_blocks(char *str, uint8_t lbads)
+{
+	longlong_t size;
+	uint64_t blocks;
+	uint_t shift;
+	char *valend, suffix;
+
+	errno = 0;
+	size = strtoll(str, &valend, 0);
+	if (errno != 0 || size <= 0)
+		errx(-1, "Namespace size \"%s\" is not valid", str);
+
+	suffix = *valend;
+	switch (suffix) {
+	case 'b':
+	case 'B':
+		/* blocks */
+		shift = 0;
+		lbads = 0;
+		valend++;
+		break;
+
+	case 'k':
+	case 'K':
+		/* kilobytes */
+		shift = 10;
+		valend++;
+		break;
+
+	case 'm':
+	case 'M':
+		/* megabytes */
+		shift = 20;
+		valend++;
+		break;
+
+	case 'g':
+	case 'G':
+		/* gigabytes */
+		shift = 30;
+		valend++;
+		break;
+
+	case '\0':
+		/* bytes */
+		shift = 0;
+		break;
+
+	default:
+		errx(-1, "Namespace size \"%s\" is not valid. "
+		    "Invalid multiplier suffix", str);
+	}
+
+	if (*valend != '\0')
+		errx(-1, "Namespace size \"%s\" is not valid. "
+		    "Invalid multiplier suffix", str);
+
+	if (size > (LLONG_MAX >> shift))
+		errx(-1, "Namespace size \"%s\" is too large. It "
+		    "can be no larger than %lld%c", str,
+		    LLONG_MAX >> shift, suffix);
+
+	blocks = ((uint64_t)size << shift) >> lbads;
+	if (blocks == 0)
+		errx(-1, "Namespace size \"%s\" is too small", str);
+
+	return (blocks);
+}
+
+static uint_t
+get_lbaf_number(char *str, nvme_identify_nsid_t *idns)
+{
+	long blksize;
+	uint_t i;
+	char *valend;
+
+	errno = 0;
+	blksize = strtol(str, &valend, 0);
+	if (errno != 0 || *valend != '\0' || blksize <= 0)
+		errx(-1, "Block size \"%s\" must be numeric and positive", str);
+
+	for (i = 0; i <= idns->id_nlbaf; i++) {
+		 if (blksize == (1l << idns->id_lbaf[i].lbaf_lbads) &&
+		    idns->id_lbaf[i].lbaf_ms == 0)
+			break;
+	}
+
+	if (i > idns->id_nlbaf)
+		errx(-1, "%d block size does not match any formats supported "
+		    "by the controller", blksize);
+
+	return (i);
+}
+
+static int
+do_namespace_create(int fd, const nvme_process_arg_t *npa)
+{
+	uint_t nsid, lbaf;
+	uint64_t blocks;
+
+	if (npa->npa_argc != 2)
+		errx(-1, "Incorrect number of arguments. Namespace size and "
+		    "block size must be specified");
+
+	lbaf = get_lbaf_number(npa->npa_argv[1], npa->npa_idns);
+
+	blocks = get_blocks(npa->npa_argv[0],
+	    npa->npa_idns->id_lbaf[lbaf].lbaf_lbads);
+
+	if (!nvme_namespace_create(fd, blocks, lbaf, &nsid))
+		errx(-1, "Failed to create namespace: %s", strerror(errno));
+
+	if (verbose)
+		printf("Namespace id %u created.\n", nsid);
+
+	return (0);
+}
+
+static void
+usage_namespace_delete(const char *c_name)
+{
+	(void) fprintf(stderr, "%s <ctl>[/<ns>]\n\n"
+	    "  Delete a single or all namespaces in the NVMe controller.\n",
+	    c_name);
+}
+
+static int
+do_namespace_delete(int fd, const nvme_process_arg_t *npa)
+{
+	if (npa->npa_argc > 0)
+		errx(-1, "Too many arguments");
+
+	if (!nvme_namespace_delete(fd))
+		errx(-1, "Failed to delete namespace(s): %s", strerror(errno));
+
+	if (verbose)
+		printf("Namespace deletion successful.\n");
 
 	return (0);
 }

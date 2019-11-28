@@ -13,6 +13,7 @@
  * Copyright 2016 Nexenta Systems, Inc.
  * Copyright 2020 Joyent, Inc.
  * Copyright 2019 Western Digital Corporation
+ * Copyright 2019 Unix Software Ltd.
  */
 
 #ifndef _SYS_NVME_H
@@ -51,7 +52,9 @@ extern "C" {
 #define	NVME_IOC_ATTACH			(NVME_IOC | 10)
 #define	NVME_IOC_FIRMWARE_DOWNLOAD	(NVME_IOC | 11)
 #define	NVME_IOC_FIRMWARE_COMMIT	(NVME_IOC | 12)
-#define	NVME_IOC_MAX			NVME_IOC_FIRMWARE_COMMIT
+#define	NVME_IOC_NAMESPACE_CREATE	(NVME_IOC | 13)
+#define	NVME_IOC_NAMESPACE_DELETE	(NVME_IOC | 14)
+#define	NVME_IOC_MAX			NVME_IOC_NAMESPACE_DELETE
 
 #define	IS_NVME_IOC(x)			((x) > NVME_IOC && (x) <= NVME_IOC_MAX)
 #define	NVME_IOC_CMD(x)			((x) & 0xff)
@@ -176,7 +179,8 @@ typedef struct {
 		uint16_t oa_security:1;	/* Security Send & Receive */
 		uint16_t oa_format:1;	/* Format NVM */
 		uint16_t oa_firmware:1;	/* Firmware Activate & Download */
-		uint16_t oa_rsvd:13;
+		uint16_t oa_ns_mgmt:1;	/* Namespace Management */
+		uint16_t oa_rsvd:12;
 	} id_oacs;
 	uint8_t	id_acl;			/* Abort Command Limit */
 	uint8_t id_aerl;		/* Asynchronous Event Request Limit */
@@ -691,6 +695,20 @@ typedef union {
 	uint32_t r;
 } nvme_firmware_commit_dw10_t;
 
+typedef struct {
+	uint64_t nsc_nsze;		/* Namespace size */
+	uint64_t nsc_ncap;		/* Namespace capacity */
+	uint8_t nsc_rsvd1[10];
+	uint8_t nsc_flbas;		/* Formatted LBA size */
+	uint8_t nsc_rsvd2[2];
+	uint8_t nsc_dps;		/* End-to-end data prot. settings */
+	uint8_t nsc_nmic;		/* multi-path and sharing cap. */
+	uint8_t nsc_rsvd3[384 - 31];
+
+	uint8_t nsc_rsvd4[1024 - 384];
+	uint8_t nsc_vendor_specific[4096 - 1024];
+} nvme_namespace_create_t;
+
 #pragma pack() /* pack(1) */
 
 /* NVMe completion status code type */
@@ -749,6 +767,8 @@ typedef union {
 #define	NVME_CQE_SC_SPC_FW_MTFA		0x12	/* FW Application Exceed MTFA */
 #define	NVME_CQE_SC_SPC_FW_PROHIBITED	0x13	/* FW Application Prohibited */
 #define	NVME_CQE_SC_SPC_FW_OVERLAP	0x14	/* Overlapping FW ranges */
+#define	NVME_CQE_SC_SPC_NS_CAPACITY	0x15	/* NS Insufficient Capacity */
+#define	NVME_CQE_SC_SPC_NS_IDENT	0x16	/* NS Identifier Unavailable */
 
 /* NVMe completion status code (NVM command specific */
 #define	NVME_CQE_SC_SPC_NVM_CNFL_ATTR	0x80	/* Conflicting Attributes */

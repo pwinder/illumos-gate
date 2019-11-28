@@ -12,6 +12,7 @@
 /*
  * Copyright 2016 Nexenta Systems, Inc.
  * Copyright 2019 Western Digital Corporation
+ * Copyright 2019 Unix Software Ltd.
  */
 
 #include <sys/types.h>
@@ -33,6 +34,7 @@ nvme_ioctl(int fd, int ioc, size_t *bufsize, void **buf, uint64_t arg,
 {
 	nvme_ioctl_t nioc = { 0 };
 	void *ptr = NULL;
+	int error;
 	int ret;
 
 	if (res != NULL)
@@ -62,11 +64,14 @@ nvme_ioctl(int fd, int ioc, size_t *bufsize, void **buf, uint64_t arg,
 		*res = nioc.n_arg;
 
 	if (ret != 0) {
+		error = errno;
+
 		if (debug)
 			warn("nvme_ioctl()");
 		if (ptr != NULL)
 			free(ptr);
 
+		errno = error;
 		return (B_FALSE);
 	}
 
@@ -199,6 +204,36 @@ nvme_firmware_commit(int fd, int slot, int action, uint16_t *sct, uint16_t *sc)
 		*sc = (uint16_t)res;
 
 	return (rv);
+}
+
+boolean_t
+nvme_namespace_create(int fd, uint64_t blocks, uint_t lbaf, uint_t *nsid)
+{
+	nvme_namespace_create_t ns_create = { 0 };
+	size_t bufsize = sizeof (ns_create);
+	void *buf = &ns_create;
+	boolean_t rv;
+	uint64_t res;
+
+	ns_create.nsc_nsze = blocks;
+	ns_create.nsc_ncap = blocks;
+	ns_create.nsc_flbas = lbaf;
+	ns_create.nsc_dps = 0;
+	ns_create.nsc_nmic = 0;
+
+	rv = nvme_ioctl(fd, NVME_IOC_NAMESPACE_CREATE, &bufsize, &buf, 0,
+	    &res);
+
+	if (rv)
+		*nsid = (uint_t)res;
+
+	return (rv);
+}
+
+boolean_t
+nvme_namespace_delete(int fd)
+{
+	return (nvme_ioctl(fd, NVME_IOC_NAMESPACE_DELETE, NULL, NULL, 0, NULL));
 }
 
 int

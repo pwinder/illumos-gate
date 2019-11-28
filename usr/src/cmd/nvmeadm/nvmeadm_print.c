@@ -12,6 +12,7 @@
 /*
  * Copyright 2016 Nexenta Systems, Inc.
  * Copyright 2019 Western Digital Corporation
+ * Copyright 2019 Unix Software Ltd.
  */
 
 /*
@@ -405,6 +406,25 @@ nvme_print_nsid_summary(nvme_identify_nsid_t *idns)
 
 }
 
+static void
+nvme_print_lba_formats(nvme_identify_nsid_t *idns)
+{
+	int i;
+
+	for (i = 0; i <= idns->id_nlbaf; i++) {
+		if (verbose == 0 && idns->id_lbaf[i].lbaf_ms != 0)
+			continue;
+
+		nvme_print(4, "LBA Format", i, NULL);
+		nvme_print_uint64(6, "Metadata Size",
+		    idns->id_lbaf[i].lbaf_ms, NULL, " bytes");
+		nvme_print_uint64(6, "LBA Data Size",
+		    1 << idns->id_lbaf[i].lbaf_lbads, NULL, " bytes");
+		nvme_print_str(6, "Relative Performance", -1,
+		    lbaf_relative_performance[idns->id_lbaf[i].lbaf_rp], 0);
+	}
+}
+
 /*
  * nvme_print_identify_ctrl
  *
@@ -413,7 +433,8 @@ nvme_print_nsid_summary(nvme_identify_nsid_t *idns)
  */
 void
 nvme_print_identify_ctrl(nvme_identify_ctrl_t *idctl,
-    nvme_capabilities_t *cap, nvme_version_t *version)
+    nvme_capabilities_t *cap, nvme_identify_nsid_t *idns,
+    nvme_version_t *version)
 {
 	int i;
 
@@ -465,6 +486,8 @@ nvme_print_identify_ctrl(nvme_identify_ctrl_t *idctl,
 	    idctl->id_oacs.oa_format, NULL, NULL);
 	nvme_print_bit(6, "Firmware Activate & Download",
 	    idctl->id_oacs.oa_firmware, NULL, NULL);
+	nvme_print_bit(6, "Namespace Management & Attachment",
+	    idctl->id_oacs.oa_ns_mgmt, NULL, NULL);
 	if (verbose) {
 		nvme_print_uint64(4, "Abort Command Limit",
 		    (uint16_t)idctl->id_acl + 1, NULL, NULL);
@@ -590,6 +613,11 @@ nvme_print_identify_ctrl(nvme_identify_ctrl_t *idctl,
 		nvme_print_uint64(6, "Relative Write Latency (0 = best)",
 		    idctl->id_psd[i].psd_rwl, NULL, NULL);
 	}
+
+	nvme_print(2, "Common Namespace Capabilities and Features", -1, NULL);
+	nvme_print_uint64(4, "Number of LBA Formats",
+	    (uint16_t)idns->id_nlbaf + 1, NULL, NULL);
+	nvme_print_lba_formats(idns);
 }
 
 /*
@@ -602,7 +630,6 @@ void
 nvme_print_identify_nsid(nvme_identify_nsid_t *idns, nvme_version_t *version)
 {
 	int bsize = 1 << idns->id_lbaf[idns->id_flbas.lba_format].lbaf_lbads;
-	int i;
 
 	nvme_print(0, "Identify Namespace", -1, NULL);
 	nvme_print(2, "Namespace Capabilities and Features", -1, NULL);
@@ -677,18 +704,7 @@ nvme_print_identify_nsid(nvme_identify_nsid_t *idns, nvme_version_t *version)
 		    idns->id_eui64[6], idns->id_eui64[7]);
 	}
 
-	for (i = 0; i <= idns->id_nlbaf; i++) {
-		if (verbose == 0 && idns->id_lbaf[i].lbaf_ms != 0)
-			continue;
-
-		nvme_print(4, "LBA Format", i, NULL);
-		nvme_print_uint64(6, "Metadata Size",
-		    idns->id_lbaf[i].lbaf_ms, NULL, " bytes");
-		nvme_print_uint64(6, "LBA Data Size",
-		    1 << idns->id_lbaf[i].lbaf_lbads, NULL, " bytes");
-		nvme_print_str(6, "Relative Performance", -1,
-		    lbaf_relative_performance[idns->id_lbaf[i].lbaf_rp], 0);
-	}
+	nvme_print_lba_formats(idns);
 }
 
 /*
