@@ -23,6 +23,7 @@
  * Use is subject to license terms.
  * Copyright 2012 Milan Jurik. All rights reserved.
  * Copyright (c) 2016 by Delphix. All rights reserved.
+ * Copyright 2019 Western Digital Corporation.
  */
 
 #if defined(DEBUG)
@@ -133,7 +134,7 @@ static int pci_get_available_prop(dev_info_t *dip, uint64_t base,
     uint64_t len, char *busra_type);
 static int pci_put_available_prop(dev_info_t *dip, uint64_t base,
     uint64_t len, char *busra_type);
-static uint32_t pci_type_ra2pci(char *type);
+static uint32_t pci_type_ra2pci(char *type, uint64_t base, uint64_t size);
 static boolean_t is_pcie_fabric(dev_info_t *dip);
 
 #define	PCI_ADDR_TYPE_MASK	(PCI_REG_ADDR_M | PCI_REG_PF_M)
@@ -1330,7 +1331,8 @@ pci_get_available_prop(dev_info_t *dip, uint64_t base, uint64_t len,
 	uint32_t	type;
 
 	/* check if we're manipulating MEM/IO resource */
-	if ((type = pci_type_ra2pci(busra_type)) == PCI_ADDR_TYPE_INVAL)
+	if ((type = pci_type_ra2pci(busra_type, base, len)) ==
+	    PCI_ADDR_TYPE_INVAL)
 		return (DDI_SUCCESS);
 
 	/* check if dip is a pci/pcie device resides in a pcie fabric */
@@ -1482,7 +1484,8 @@ pci_put_available_prop(dev_info_t *dip, uint64_t base, uint64_t len,
 	uint32_t	type;
 
 	/* check if we're manipulating MEM/IO resource */
-	if ((type = pci_type_ra2pci(busra_type)) == PCI_ADDR_TYPE_INVAL)
+	if ((type = pci_type_ra2pci(busra_type, base, len)) ==
+	    PCI_ADDR_TYPE_INVAL)
 		return (DDI_SUCCESS);
 
 	/* check if dip is a pci/pcie device resides in a pcie fabric */
@@ -1686,21 +1689,21 @@ failure:
 }
 
 static uint32_t
-pci_type_ra2pci(char *type)
+pci_type_ra2pci(char *type, uint64_t base, uint64_t size)
 {
 	uint32_t	pci_type = PCI_ADDR_TYPE_INVAL;
+	uint32_t	mem_type = PCI_ADDR_MEM32;
 
-	/*
-	 * No 64 bit mem support for now
-	 */
-	if (strcmp(type, NDI_RA_TYPE_IO) == 0) {
-		pci_type = PCI_ADDR_IO;
+	if (strcmp(type, NDI_RA_TYPE_IO) == 0)
+		return (PCI_ADDR_IO);
 
-	} else if (strcmp(type, NDI_RA_TYPE_MEM) == 0) {
-		pci_type = PCI_ADDR_MEM32;
+	if (base + size > UINT_MAX)
+		mem_type = PCI_ADDR_MEM64;
 
-	} else if (strcmp(type, NDI_RA_TYPE_PCI_PREFETCH_MEM)  == 0) {
-		pci_type = PCI_ADDR_MEM32;
+	if (strcmp(type, NDI_RA_TYPE_MEM) == 0) {
+		pci_type = mem_type;
+	} else if (strcmp(type, NDI_RA_TYPE_PCI_PREFETCH_MEM) == 0) {
+		pci_type = mem_type;
 		pci_type |= PCI_REG_PF_M;
 	}
 
