@@ -107,7 +107,9 @@ struct pci_bus_resource {
 	uchar_t num_cbb;	/* # of CardBus Bridges on the bus */
 	boolean_t io_reprogram;	/* need io reprog on this bus */
 	boolean_t mem_reprogram;	/* need mem reprog on this bus */
+	boolean_t pmem_reprogram;	/* need pmem reprog on this bus */
 	boolean_t subtractive;	/* subtractive PPB */
+	uint64_t pmem_size;	/* existing children required prefetch size */
 	uint64_t mem_size;	/* existing children required MEM space size */
 	uint_t io_size;		/* existing children required I/O space size */
 };

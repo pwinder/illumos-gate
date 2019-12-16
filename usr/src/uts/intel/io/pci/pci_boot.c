@@ -62,6 +62,15 @@
 #define	CONFIG_FIX	3
 #define	COMPAT_BUFSIZE	512
 
+/*
+ * The default size (in units of PPB_MEM_ALIGNMENT) to reserve for
+ * prefetch memory when a pci-pci bridge slot is empty.
+ * It can be changed by setting the boot (-B) option:
+ *	pci-prefetch-mem-default
+ */
+#define	PPB_PMEM_DEFAULT	32
+static uint64_t ppb_prefetch_reserve = PPB_PMEM_DEFAULT;
+
 #define	PPB_IO_ALIGNMENT	0x1000		/* 4K aligned */
 #define	PPB_MEM_ALIGNMENT	0x100000	/* 1M aligned */
 /* round down to nearest power of two */
@@ -804,6 +813,67 @@ get_parbus_mem_res(uchar_t parbus, uchar_t bus, uint64_t size, uint64_t align)
 	return (addr);
 }
 
+static uint64_t
+get_parbus_pmem_res(uchar_t parbus, uchar_t bus, uint64_t size, uint64_t align)
+{
+	uint64_t addr = 0;
+	uchar_t res_bus;
+
+	/*
+	 * Skip root(peer) buses in multiple-root-bus systems when
+	 * ACPI resource discovery was not successfully done.
+	 */
+	if ((pci_bus_res[parbus].par_bus == (uchar_t)-1) &&
+	    (num_root_bus > 1) && (acpi_resource_discovery <= 0))
+		return (0);
+
+	res_bus = parbus;
+	while (pci_bus_res[res_bus].subtractive) {
+		if (pci_bus_res[res_bus].pmem_avail)
+			break;
+
+		res_bus = pci_bus_res[res_bus].par_bus;
+		if (res_bus == (uchar_t)-1)
+			break; /* root bus already */
+	}
+
+	/*
+	 * First look to see if there is any in the pmem_avail list.
+	 */
+	if (pci_bus_res[res_bus].pmem_avail) {
+		addr = memlist_find(&pci_bus_res[res_bus].pmem_avail,
+		    size, align);
+
+		if (addr)
+			memlist_insert(&pci_bus_res[res_bus].pmem_used,
+			    addr, size);
+	}
+
+	/*
+	 * If we didn't find any in the pmem_avail list, it is ok to
+	 * take some from the global mem_avail list.
+	 */
+	if (!addr && pci_bus_res[res_bus].mem_avail) {
+		addr = memlist_find(&pci_bus_res[res_bus].mem_avail,
+		    size, align);
+
+		if (addr)
+			memlist_insert(&pci_bus_res[res_bus].pmem_used,
+			    addr, size);
+	}
+
+	if (addr) {
+		/* free the old resource */
+		memlist_free_all(&pci_bus_res[bus].pmem_avail);
+		memlist_free_all(&pci_bus_res[bus].pmem_used);
+
+		/* add the new resource */
+		memlist_insert(&pci_bus_res[bus].pmem_avail, addr, size);
+	}
+
+	return (addr);
+}
+
 /*
  * given a cap_id, return its cap_id location in config space
  */
@@ -888,7 +958,8 @@ fix_ppb_res(uchar_t secbus, boolean_t prog_sub)
 	uchar_t parbus, subbus;
 	uint_t io_base, io_limit, mem_base;
 	uint_t io_size, io_align;
-	uint64_t mem_size, mem_align, mem_limit;
+	uint64_t mem_size, mem_limit;
+	uint64_t pmem_base, pmem_size, pmem_limit;
 	uint64_t addr = 0;
 	int *regp = NULL;
 	uint_t reglen;
@@ -896,6 +967,7 @@ fix_ppb_res(uchar_t secbus, boolean_t prog_sub)
 	dev_info_t *dip;
 	uint16_t cmd_reg;
 	struct memlist *list, *scratch_list;
+	boolean_t is_pf64;
 
 	/* skip root (peer) PCI busses */
 	if (pci_bus_res[secbus].par_bus == (uchar_t)-1)
@@ -1006,8 +1078,13 @@ fix_ppb_res(uchar_t secbus, boolean_t prog_sub)
 		mem_size = pci_bus_res[secbus].mem_size;
 		mem_size = P2ROUNDUP(mem_size, PPB_MEM_ALIGNMENT);
 	}
-	mem_align = mem_size;
-	P2LE(mem_align);
+	pmem_size = (subbus - secbus + 1) * ppb_prefetch_reserve *
+	    PPB_MEM_ALIGNMENT;
+	if (pmem_size < pci_bus_res[secbus].pmem_size) {
+		pmem_size = pci_bus_res[secbus].pmem_size;
+		pmem_size = P2ROUNDUP(pmem_size, PPB_MEM_ALIGNMENT);
+	} else {
+	}
 
 	/* Subtractive bridge */
 	if (pci_bus_res[secbus].subtractive && prog_sub) {
@@ -1053,7 +1130,7 @@ fix_ppb_res(uchar_t secbus, boolean_t prog_sub)
 		 */
 		if (pci_bus_res[secbus].mem_avail == NULL) {
 			addr = get_parbus_mem_res(parbus, secbus, mem_size,
-			    mem_align);
+			    PPB_MEM_ALIGNMENT);
 			if (addr) {
 				add_ranges_prop(secbus, 1);
 				pci_bus_res[secbus].mem_reprogram =
@@ -1220,7 +1297,7 @@ fix_ppb_res(uchar_t secbus, boolean_t prog_sub)
 		} else {
 			/* get new mem resource from parent bus */
 			addr = get_parbus_mem_res(parbus, secbus, mem_size,
-			    mem_align);
+			    PPB_MEM_ALIGNMENT);
 			if (addr) {
 				mem_base = addr;
 				mem_limit = addr + mem_size - 1;
@@ -1234,28 +1311,6 @@ fix_ppb_res(uchar_t secbus, boolean_t prog_sub)
 			    (uint16_t)((mem_base>>16) & 0xfff0));
 			pci_putw(bus, dev, func, PCI_BCNF_MEM_LIMIT,
 			    (uint16_t)((mem_limit>>16) & 0xfff0));
-			/*
-			 * Disable PMEM window by setting base > limit.
-			 * We currently don't reprogram the PMEM like we've
-			 * done for I/O and MEM. (Devices that support prefetch
-			 * can use non-prefetch MEM.) Anyway, if the MEM access
-			 * bit is initially disabled by BIOS, we disable the
-			 * PMEM window manually by setting PMEM base > PMEM
-			 * limit here, in case there are incorrect values in
-			 * them from BIOS, so that we won't get in trouble once
-			 * the MEM access bit is enabled at the end of this
-			 * function.
-			 */
-			if (!(cmd_reg & PCI_COMM_MAE)) {
-				pci_putw(bus, dev, func, PCI_BCNF_PF_BASE_LOW,
-				    0xfff0);
-				pci_putw(bus, dev, func, PCI_BCNF_PF_LIMIT_LOW,
-				    0x0);
-				pci_putl(bus, dev, func, PCI_BCNF_PF_BASE_HIGH,
-				    0xffffffff);
-				pci_putl(bus, dev, func, PCI_BCNF_PF_LIMIT_HIGH,
-				    0x0);
-			}
 
 			add_ranges_prop(secbus, 1);
 
@@ -1266,19 +1321,126 @@ fix_ppb_res(uchar_t secbus, boolean_t prog_sub)
 	}
 	memlist_free_all(&scratch_list);
 
+	if (pmem_size == 0)
+		goto cmd_enable;
+
+	/*
+	 * Check prefetch memory space as we did memory space.
+	 */
+	pmem_base = (uint_t)pci_getw(bus, dev, func, PCI_BCNF_PF_BASE_LOW);
+	is_pf64 = (pmem_base & PCI_BCNF_ADDR_MASK) == PCI_BCNF_PF_MEM_64BIT;
+	pmem_base = (pmem_base & PCI_BCNF_MEM_MASK) << 16;
+
+	pmem_limit = (uint_t)pci_getw(bus, dev, func, PCI_BCNF_PF_LIMIT_LOW);
+	pmem_limit = ((pmem_limit & PCI_BCNF_MEM_MASK) << 16) | 0xfffff;
+
+	if (is_pf64) {
+		pmem_base |= (uint64_t)pci_getl(bus, dev, func,
+		    PCI_BCNF_PF_BASE_HIGH) << 32;
+
+		pmem_limit |= (uint64_t)pci_getw(bus, dev, func,
+		    PCI_BCNF_PF_LIMIT_HIGH) << 32;
+	}
+
+	scratch_list = memlist_dup(pci_bus_res[secbus].pmem_avail);
+	memlist_merge(&pci_bus_res[secbus].pmem_used, &scratch_list);
+
+	if (pci_bus_res[parbus].pmem_reprogram ||
+	    pmem_base > pmem_limit || !(cmd_reg & PCI_COMM_MAE)) {
+		if (pci_bus_res[secbus].pmem_used) {
+			memlist_subsume(&pci_bus_res[secbus].pmem_used,
+			    &pci_bus_res[secbus].pmem_avail);
+		}
+
+		if (pci_bus_res[secbus].pmem_avail &&
+		    (!pci_bus_res[parbus].pmem_reprogram) &&
+		    (!pci_bus_res[parbus].subtractive)) {
+			/* rechoose old mem resource */
+			list = pci_bus_res[secbus].pmem_avail;
+
+			pmem_base = list->ml_address;
+			pmem_base = P2ALIGN(pmem_base, PPB_MEM_ALIGNMENT);
+			pmem_limit = list->ml_address + list->ml_size - 1;
+
+			while ((list = list->ml_next) != NULL) {
+				if ((list->ml_address + list->ml_size) >
+				    pmem_limit) {
+					pmem_limit = list->ml_address +
+					    list->ml_size - 1;
+				}
+			}
+
+			pmem_limit = P2ROUNDUP(pmem_limit, PPB_MEM_ALIGNMENT)
+			    - 1;
+			pmem_size = pmem_limit + 1 - pmem_base;
+			ASSERT(pmem_base <= pmem_limit);
+			memlist_free_all(&pci_bus_res[secbus].pmem_avail);
+			memlist_insert(&pci_bus_res[secbus].pmem_avail,
+			    pmem_base, pmem_size);
+			memlist_insert(&pci_bus_res[parbus].pmem_used,
+			    pmem_base, pmem_size);
+			(void) memlist_remove(&pci_bus_res[parbus].pmem_avail,
+			    pmem_base, pmem_size);
+			pci_bus_res[secbus].pmem_reprogram = B_TRUE;
+		} else {
+			/* get new mem resource from parent bus */
+			addr = get_parbus_pmem_res(parbus, secbus, pmem_size,
+			    PPB_MEM_ALIGNMENT);
+			if (addr) {
+				pmem_base = addr;
+				pmem_limit = addr + pmem_size - 1;
+				pci_bus_res[secbus].pmem_reprogram = B_TRUE;
+			}
+		}
+
+		if (pci_bus_res[secbus].pmem_reprogram) {
+			/* reprogram PPB PMEM regs */
+			pci_putw(bus, dev, func, PCI_BCNF_PF_BASE_LOW,
+			    (uint16_t)((pmem_base >> 16) & PCI_BCNF_MEM_MASK));
+			pci_putw(bus, dev, func, PCI_BCNF_PF_LIMIT_LOW,
+			    (uint16_t)((pmem_limit >> 16) & PCI_BCNF_MEM_MASK));
+			pci_putl(bus, dev, func, PCI_BCNF_PF_BASE_HIGH,
+			    (uint32_t)(pmem_base >> 32));
+			pci_putl(bus, dev, func, PCI_BCNF_PF_LIMIT_HIGH,
+			    (uint32_t)(pmem_limit >> 32));
+
+			cmn_err(CE_NOTE, "!reprogram prefetch pmem-range on"
+			    " ppb[%x/%x/%x]: 0x%"PRIx64" ~ 0x%"PRIx64"\n",
+			    bus, dev, func, pmem_base, pmem_limit);
+		}
+
+	}
+
+	memlist_free_all(&scratch_list);
+
 cmd_enable:
 	if (pci_bus_res[secbus].io_avail)
 		cmd_reg |= PCI_COMM_IO | PCI_COMM_ME;
-	if (pci_bus_res[secbus].mem_avail)
+	if (pci_bus_res[secbus].mem_avail || pci_bus_res[secbus].pmem_avail)
 		cmd_reg |= PCI_COMM_MAE | PCI_COMM_ME;
 	pci_putw(bus, dev, func, PCI_CONF_COMM, cmd_reg);
+}
+
+static void
+accumulate_avail_mem(uchar_t bus, uint64_t *mem, uint64_t *pmem)
+{
+	struct memlist *mp;
+
+	for (mp = pci_bus_res[bus].mem_avail; mp != NULL; mp = mp->ml_next)
+		*mem += mp->ml_size;
+
+	for (mp = pci_bus_res[bus].pmem_avail; mp != NULL; mp = mp->ml_next)
+		*pmem += mp->ml_size;
 }
 
 void
 pci_reprogram(void)
 {
 	int i, pci_reconfig = 1;
+	struct memlist *last;
+	uint64_t mem_avail, pmem_avail, n;
 	char *onoff;
+	char *pmem_str;
 	int bus;
 
 	/*
@@ -1322,6 +1484,8 @@ pci_reprogram(void)
 	/*
 	 * Do root-bus resource discovery
 	 */
+	mem_avail = 0;
+	pmem_avail = 0;
 	for (bus = 0; bus <= pci_bios_maxbus; bus++) {
 		/* skip non-root (peer) PCI busses */
 		if (pci_bus_res[bus].par_bus != (uchar_t)-1)
@@ -1343,10 +1507,6 @@ pci_reprogram(void)
 		    pci_bus_res[bus].mem_used);
 		memlist_remove_list(&pci_bus_res[bus].pmem_avail,
 		    pci_bus_res[bus].pmem_used);
-		memlist_remove_list(&pci_bus_res[bus].mem_avail,
-		    pci_bus_res[bus].pmem_used);
-		memlist_remove_list(&pci_bus_res[bus].pmem_avail,
-		    pci_bus_res[bus].mem_used);
 
 		memlist_remove_list(&pci_bus_res[bus].io_avail,
 		    isa_res.io_used);
@@ -1364,8 +1524,8 @@ pci_reprogram(void)
 		 *	000C0000 - 000FFFFF	ROM area
 		 */
 		(void) memlist_remove(&pci_bus_res[bus].mem_avail, 0, 0x100000);
-		(void) memlist_remove(&pci_bus_res[bus].pmem_avail,
-		    0, 0x100000);
+
+		accumulate_avail_mem(bus, &mem_avail, &pmem_avail);
 	}
 
 	memlist_free_all(&isa_res.io_used);
@@ -1380,6 +1540,40 @@ pci_reprogram(void)
 		/* setup bus range resource on each bus */
 		setup_bus_res(i);
 	}
+
+	if (ddi_prop_lookup_string(DDI_DEV_T_ANY, ddi_root_node(),
+	    DDI_PROP_DONTPASS, "pci-prefetch-mem-default", &pmem_str) ==
+	    DDI_SUCCESS) {
+		(void) ddi_strtoull(pmem_str, NULL, 0,
+		    (unsigned long long *)&ppb_prefetch_reserve);
+
+		ddi_prop_free(pmem_str);
+	}
+
+	/*
+	 * Look at how much memory is available, and see how many
+	 * empty bridges would it take to consume it all. The
+	 * algorithms for reserving prefetch memory do try and
+	 * take it from a range as returned by the BIOS, but if
+	 * that range is empty it then reverts to the global
+	 * pool of available memory.
+	 */
+	n = (pmem_avail > 0 ? pmem_avail : mem_avail) /
+	    (ppb_prefetch_reserve * PPB_MEM_ALIGNMENT);
+
+	/*
+	 * Keeping in mind that these pools of memory are used
+	 * to carve out the PCI memory demands for all PCI
+	 * devices. If there is not enough for at least 32,
+	 * then don't reserve any. This should prevent over
+	 * reserving which runs the risk of depriving the
+	 * installed PCI devices at the expense of empty slots.
+	 */
+	if (n < 32)
+		ppb_prefetch_reserve = 0;
+
+	cmn_err(CE_NOTE, "!0x%"PRIx64" prefetch memory is reserved for "
+	    "each empty ppb slot", ppb_prefetch_reserve * PPB_MEM_ALIGNMENT);
 
 	if (ddi_prop_lookup_string(DDI_DEV_T_ANY, ddi_root_node(),
 	    DDI_PROP_DONTPASS, "pci-reprog", &onoff) == DDI_SUCCESS) {
@@ -1527,7 +1721,8 @@ enumerate_bus_devs(uchar_t bus, int config_op)
 			devlist = entry->next;
 			if (entry->reprogram ||
 			    pci_bus_res[bus].io_reprogram ||
-			    pci_bus_res[bus].mem_reprogram) {
+			    pci_bus_res[bus].mem_reprogram ||
+			    pci_bus_res[bus].pmem_reprogram) {
 				/* reprogram device(s) */
 				(void) add_reg_props(entry->dip, bus,
 				    entry->dev, entry->func, CONFIG_NEW, 0);
@@ -1592,6 +1787,8 @@ enumerate_bus_devs(uchar_t bus, int config_op)
 			    pci_bus_res[bus].io_size;
 			pci_bus_res[par_bus].mem_size +=
 			    pci_bus_res[bus].mem_size;
+			pci_bus_res[par_bus].pmem_size +=
+			    pci_bus_res[bus].pmem_size;
 
 			if (pci_bus_res[bus].io_used)
 				memlist_merge(&pci_bus_res[bus].io_used,
@@ -2388,7 +2585,7 @@ add_reg_props(dev_info_t *dip, uchar_t bus, uchar_t dev, uchar_t func,
 {
 	uchar_t baseclass, subclass, progclass, header;
 	ushort_t bar_sz;
-	uint64_t value = 0;
+	uint64_t base64, len, value = 0;
 	uint_t devloc;
 	uint_t base, base_hi, type;
 	ushort_t offset, end;
@@ -2473,12 +2670,12 @@ add_reg_props(dev_info_t *dip, uchar_t bus, uchar_t dev, uchar_t func,
 		/* construct phys hi,med.lo, size hi, lo */
 		if ((pciide && j < 4) || (base & PCI_BASE_SPACE_IO)) {
 			int hard_decode = 0;
-			uint_t len;
+			uint_t ide_len;
 
 			/* i/o space */
 			bar_sz = PCI_BAR_SZ_32;
 			value &= PCI_BASE_IO_ADDR_M;
-			len = ((value ^ (value-1)) + 1) >> 1;
+			ide_len = ((value ^ (value-1)) + 1) >> 1;
 
 			/* XXX Adjust first 4 IDE registers */
 			if (pciide) {
@@ -2486,7 +2683,7 @@ add_reg_props(dev_info_t *dip, uchar_t bus, uchar_t dev, uchar_t func,
 					progclass = (PCI_IDE_IF_NATIVE_PRI |
 					    PCI_IDE_IF_NATIVE_SEC);
 				hard_decode = pciIdeAdjustBAR(progclass, j,
-				    &base, &len);
+				    &base, &ide_len);
 			} else if (value == 0) {
 				/* skip base regs with size of 0 */
 				continue;
@@ -2499,7 +2696,7 @@ add_reg_props(dev_info_t *dip, uchar_t bus, uchar_t dev, uchar_t func,
 			assigned[nasgn].pci_phys_hi =
 			    PCI_RELOCAT_B | regs[nreg].pci_phys_hi;
 			regs[nreg].pci_size_low =
-			    assigned[nasgn].pci_size_low = len;
+			    assigned[nasgn].pci_size_low = ide_len;
 			type = base & (~PCI_BASE_IO_ADDR_M);
 			base &= PCI_BASE_IO_ADDR_M;
 			/*
@@ -2530,17 +2727,18 @@ add_reg_props(dev_info_t *dip, uchar_t bus, uchar_t dev, uchar_t func,
 				/* take out of the resource map of the bus */
 				if (base != 0) {
 					(void) memlist_remove(io_avail, base,
-					    len);
-					memlist_insert(io_used, base, len);
+					    ide_len);
+					memlist_insert(io_used, base, ide_len);
 				} else {
 					reprogram = 1;
 				}
-				pci_bus_res[bus].io_size += len;
+				pci_bus_res[bus].io_size += ide_len;
 			} else if ((*io_avail && base == 0) ||
 			    pci_bus_res[bus].io_reprogram) {
-				base = (uint_t)memlist_find(io_avail, len, len);
+				base = (uint_t)memlist_find(io_avail, ide_len,
+				    ide_len);
 				if (base != 0) {
-					memlist_insert(io_used, base, len);
+					memlist_insert(io_used, base, ide_len);
 					/* XXX need to worry about 64-bit? */
 					pci_putl(bus, dev, func, offset,
 					    base | type);
@@ -2551,144 +2749,163 @@ add_reg_props(dev_info_t *dip, uchar_t bus, uchar_t dev, uchar_t func,
 					cmn_err(CE_WARN, "failed to program"
 					    " IO space [%d/%d/%d] BAR@0x%x"
 					    " length 0x%x",
-					    bus, dev, func, offset, len);
+					    bus, dev, func, offset, ide_len);
 				}
 			}
 			assigned[nasgn].pci_phys_low = base;
 			nreg++, nasgn++;
 
+			continue;
+		}
+
+		/* memory space */
+		if ((base & PCI_BASE_TYPE_M) == PCI_BASE_TYPE_ALL) {
+			bar_sz = PCI_BAR_SZ_64;
+			base_hi = pci_getl(bus, dev, func, offset + 4);
+			pci_putl(bus, dev, func, offset + 4,
+			    0xffffffff);
+			value |= (uint64_t)pci_getl(bus, dev, func,
+			    offset + 4) << 32;
+			pci_putl(bus, dev, func, offset + 4, base_hi);
+			phys_hi = PCI_ADDR_MEM64;
+			value &= PCI_BASE_M_ADDR64_M;
 		} else {
-			uint64_t len;
-			/* memory space */
-			if ((base & PCI_BASE_TYPE_M) == PCI_BASE_TYPE_ALL) {
-				bar_sz = PCI_BAR_SZ_64;
-				base_hi = pci_getl(bus, dev, func, offset + 4);
-				pci_putl(bus, dev, func, offset + 4,
-				    0xffffffff);
-				value |= (uint64_t)pci_getl(bus, dev, func,
-				    offset + 4) << 32;
-				pci_putl(bus, dev, func, offset + 4, base_hi);
-				phys_hi = PCI_ADDR_MEM64;
-				value &= PCI_BASE_M_ADDR64_M;
-			} else {
-				bar_sz = PCI_BAR_SZ_32;
-				base_hi = 0;
-				phys_hi = PCI_ADDR_MEM32;
-				value &= PCI_BASE_M_ADDR_M;
-			}
+			bar_sz = PCI_BAR_SZ_32;
+			base_hi = 0;
+			phys_hi = PCI_ADDR_MEM32;
+			value &= PCI_BASE_M_ADDR_M;
+		}
 
-			/* skip base regs with size of 0 */
-			if (value == 0)
-				continue;
+		/* skip base regs with size of 0 */
+		if (value == 0)
+			continue;
 
-			len = ((value ^ (value-1)) + 1) >> 1;
-			regs[nreg].pci_size_low =
-			    assigned[nasgn].pci_size_low = len & 0xffffffff;
-			regs[nreg].pci_size_hi =
-			    assigned[nasgn].pci_size_hi = len >> 32;
+		len = ((value ^ (value-1)) + 1) >> 1;
+		regs[nreg].pci_size_low =
+		    assigned[nasgn].pci_size_low = len & 0xffffffff;
+		regs[nreg].pci_size_hi =
+		    assigned[nasgn].pci_size_hi = len >> 32;
 
-			phys_hi |= (devloc | offset);
-			if (base & PCI_BASE_PREF_M)
-				phys_hi |= PCI_PREFETCH_B;
+		phys_hi |= (devloc | offset);
+		if (base & PCI_BASE_PREF_M)
+			phys_hi |= PCI_PREFETCH_B;
 
-			/*
-			 * A device under a subtractive PPB can allocate
-			 * resources from its parent bus if there is no resource
-			 * available on its own bus.
-			 */
-			if ((config_op == CONFIG_NEW) && (*mem_avail == NULL)) {
-				res_bus = bus;
-				while (pci_bus_res[res_bus].subtractive) {
-					res_bus = pci_bus_res[res_bus].par_bus;
-					if (res_bus == (uchar_t)-1)
-						break; /* root bus already */
-					mem_avail =
-					    &pci_bus_res[res_bus].mem_avail;
-					pmem_avail =
-					    &pci_bus_res [res_bus].pmem_avail;
-					/*
-					 * Break out as long as at least
-					 * mem_avail is available
-					 */
-					if ((*pmem_avail &&
-					    (phys_hi & PCI_PREFETCH_B)) ||
-					    *mem_avail)
-						break;
-				}
-			}
-
-			regs[nreg].pci_phys_hi =
-			    assigned[nasgn].pci_phys_hi = phys_hi;
-			assigned[nasgn].pci_phys_hi |= PCI_RELOCAT_B;
-			assigned[nasgn].pci_phys_mid = base_hi;
-			type = base & ~PCI_BASE_M_ADDR_M;
-			base &= PCI_BASE_M_ADDR_M;
-
-			if (config_op == CONFIG_INFO) {
-				/* take out of the resource map of the bus */
-				if (base != 0) {
-					/* remove from PMEM and MEM space */
-					(void) memlist_remove(mem_avail,
-					    base, len);
-					(void) memlist_remove(pmem_avail,
-					    base, len);
-					/* only note as used in correct map */
-					if (phys_hi & PCI_PREFETCH_B)
-						memlist_insert(pmem_used,
-						    base, len);
-					else
-						memlist_insert(mem_used,
-						    base, len);
-				} else {
-					reprogram = 1;
-				}
-				pci_bus_res[bus].mem_size += len;
-			} else if ((*mem_avail && base == 0) ||
-			    pci_bus_res[bus].mem_reprogram) {
+		/*
+		 * A device under a subtractive PPB can allocate
+		 * resources from its parent bus if there is no resource
+		 * available on its own bus.
+		 */
+		if ((config_op == CONFIG_NEW) && (*mem_avail == NULL)) {
+			res_bus = bus;
+			while (pci_bus_res[res_bus].subtractive) {
+				res_bus = pci_bus_res[res_bus].par_bus;
+				if (res_bus == (uchar_t)-1)
+					break; /* root bus already */
+				mem_avail =
+				    &pci_bus_res[res_bus].mem_avail;
+				pmem_avail =
+				    &pci_bus_res [res_bus].pmem_avail;
 				/*
-				 * When desired, attempt a prefetchable
-				 * allocation first
+				 * Break out as long as at least
+				 * mem_avail is available
+				 */
+				if ((*pmem_avail &&
+				    (phys_hi & PCI_PREFETCH_B)) ||
+				    *mem_avail)
+					break;
+			}
+		}
+
+		regs[nreg].pci_phys_hi = assigned[nasgn].pci_phys_hi = phys_hi;
+		assigned[nasgn].pci_phys_hi |= PCI_RELOCAT_B;
+		assigned[nasgn].pci_phys_mid = base_hi;
+		type = base & ~PCI_BASE_M_ADDR_M;
+		base &= PCI_BASE_M_ADDR_M;
+		base64 = (uint64_t)base_hi << 32 | base;
+
+		if (config_op == CONFIG_INFO) {
+			/* take out of the resource map of the bus */
+			if (base64 != 0) {
+				int rv = 1;
+
+				/*
+				 * If it is flagged as prefetch, try
+				 * pmem first, but if that fails get it
+				 * from non-prefetch mem.
 				 */
 				if (phys_hi & PCI_PREFETCH_B) {
-					base = (uint_t)memlist_find(pmem_avail,
-					    len, len);
-					if (base != 0) {
+					/* remove from PMEM space */
+					rv = memlist_remove(pmem_used, base64,
+					    len);
+					if (rv == 0)
 						memlist_insert(pmem_used,
-						    base, len);
-						(void) memlist_remove(mem_avail,
-						    base, len);
-					}
+						    base64, len);
 				}
-				/*
-				 * If prefetchable allocation was not
-				 * desired, or failed, attempt ordinary
-				 * memory allocation
-				 */
-				if (base == 0) {
-					base = (uint_t)memlist_find(mem_avail,
-					    len, len);
-					if (base != 0) {
-						memlist_insert(mem_used,
-						    base, len);
-						(void) memlist_remove(
-						    pmem_avail, base, len);
-					}
+
+				if (rv != 0) {
+					/* remove from MEM space */
+					(void) memlist_remove( mem_avail,
+					    base64, len);
+					memlist_insert(mem_used, base64, len);
 				}
-				if (base != 0) {
-					pci_putl(bus, dev, func, offset,
-					    base | type);
-					base = pci_getl(bus, dev, func, offset);
-					base &= PCI_BASE_M_ADDR_M;
-				} else
-					cmn_err(CE_WARN, "failed to program "
-					    "mem space [%d/%d/%d] BAR@0x%x"
-					    " length 0x%"PRIx64,
-					    bus, dev, func, offset, len);
+			} else {
+				reprogram = 1;
 			}
-			assigned[nasgn].pci_phys_low = base;
-			nreg++, nasgn++;
+			if (phys_hi & PCI_PREFETCH_B)
+				pci_bus_res[bus].pmem_size += len;
+			else
+				pci_bus_res[bus].mem_size += len;
+		} else if ((*mem_avail && base64 == 0) ||
+		    pci_bus_res[bus].mem_reprogram ||
+		    pci_bus_res[bus].pmem_reprogram) {
+			/*
+			 * When desired, attempt a prefetchable
+			 * allocation first
+			 */
+			if (base64 == 0) {
+				if (phys_hi & PCI_PREFETCH_B) {
+					base64 = memlist_find(pmem_avail, len,
+					    len);
+					if (base64 != 0)
+						memlist_insert(pmem_used,
+						    base64, len);
+				}
+				if (base64 == 0) {
+					base64 = memlist_find(mem_avail, len,
+					    len);
+					if (base64 != 0)
+						memlist_insert(mem_used, base64,
+						    len);
+				}
+			}
+
+			if (base64 != 0) {
+				pci_putl(bus, dev, func, offset,
+				    (uint32_t)base64 | type);
+				base = pci_getl(bus, dev, func, offset);
+				base &= PCI_BASE_M_ADDR_M;
+				if ((type & PCI_BASE_TYPE_M) ==
+				    PCI_BASE_TYPE_ALL) {
+					base_hi = (uint32_t)(base64 >> 32);
+					pci_putl(bus, dev, func,
+					    offset + 4, base_hi);
+				} else {
+					base_hi = 0;
+				}
+			} else {
+				cmn_err(CE_WARN, "failed to program "
+				    "mem space [%d/%d/%d] BAR@0x%x"
+				    " length 0x%"PRIx64,
+				    bus, dev, func, offset, len);
+
+				base = base_hi = 0;
+			}
 		}
+		assigned[nasgn].pci_phys_low = base;
+		assigned[nasgn].pci_phys_mid = base_hi;
+		nreg++, nasgn++;
 	}
+
 	switch (header) {
 	case PCI_HEADER_ZERO:
 		offset = PCI_CONF_ROM;
@@ -2771,7 +2988,6 @@ add_reg_props(dev_info_t *dip, uchar_t bus, uchar_t dev, uchar_t func,
 		nreg++, nasgn++;
 		/* remove from MEM and PMEM space */
 		(void) memlist_remove(mem_avail, 0xa0000, 0x20000);
-		(void) memlist_remove(pmem_avail, 0xa0000, 0x20000);
 		memlist_insert(mem_used, 0xa0000, 0x20000);
 		pci_bus_res[bus].mem_size += 0x20000;
 	}
@@ -2948,18 +3164,12 @@ add_ppb_props(dev_info_t *dip, uchar_t bus, uchar_t dev, uchar_t func,
 	    0xfffff;
 	if (mem_range[0] != 0 && mem_range[0] < mem_range[1]) {
 		memlist_insert(&pci_bus_res[secbus].mem_avail,
-		    (uint64_t)mem_range[0],
-		    (uint64_t)(mem_range[1] - mem_range[0] + 1));
+		    mem_range[0], mem_range[1] - mem_range[0] + 1);
 		memlist_insert(&pci_bus_res[bus].mem_used,
-		    (uint64_t)mem_range[0],
-		    (uint64_t)(mem_range[1] - mem_range[0] + 1));
+		    mem_range[0], mem_range[1] - mem_range[0] + 1);
 		/* remove from parent resource list */
 		(void) memlist_remove(&pci_bus_res[bus].mem_avail,
-		    (uint64_t)mem_range[0],
-		    (uint64_t)(mem_range[1] - mem_range[0] + 1));
-		(void) memlist_remove(&pci_bus_res[bus].pmem_avail,
-		    (uint64_t)mem_range[0],
-		    (uint64_t)(mem_range[1] - mem_range[0] + 1));
+		    mem_range[0], mem_range[1] - mem_range[0] + 1);
 		dcmn_err(CE_NOTE, "bus %d mem-range: 0x%" PRIx64 "-%" PRIx64,
 		    secbus, mem_range[0], mem_range[1]);
 	}
@@ -2979,18 +3189,14 @@ add_ppb_props(dev_info_t *dip, uchar_t bus, uchar_t dev, uchar_t func,
 	}
 	if (pmem_range[0] != 0 && pmem_range[0] < pmem_range[1]) {
 		memlist_insert(&pci_bus_res[secbus].pmem_avail,
-		    (uint64_t)pmem_range[0],
-		    (uint64_t)(pmem_range[1] - pmem_range[0] + 1));
+		    pmem_range[0], pmem_range[1] - pmem_range[0] + 1);
 		memlist_insert(&pci_bus_res[bus].pmem_used,
-		    (uint64_t)pmem_range[0],
-		    (uint64_t)(pmem_range[1] - pmem_range[0] + 1));
+		    pmem_range[0], pmem_range[1] - pmem_range[0] + 1);
 		/* remove from parent resource list */
 		(void) memlist_remove(&pci_bus_res[bus].pmem_avail,
-		    (uint64_t)pmem_range[0],
-		    (uint64_t)(pmem_range[1] - pmem_range[0] + 1));
+		    pmem_range[0], pmem_range[1] - pmem_range[0] + 1);
 		(void) memlist_remove(&pci_bus_res[bus].mem_avail,
-		    (uint64_t)pmem_range[0],
-		    (uint64_t)(pmem_range[1] - pmem_range[0] + 1));
+		    pmem_range[0], pmem_range[1] - pmem_range[0] + 1);
 		dcmn_err(CE_NOTE, "bus %d pmem-range: 0x%" PRIx64 "-%" PRIx64,
 		    secbus, pmem_range[0], pmem_range[1]);
 	}
@@ -3247,11 +3453,16 @@ memlist_to_spec(struct pci_phys_spec *sp, struct memlist *list, int type)
 	int i = 0;
 
 	while (list) {
-		/* assume 32-bit addresses */
+		if ((type & PCI_REG_ADDR_M) == PCI_ADDR_MEM32 &&
+		    (list->ml_address >= UINT32_MAX ||
+		    list->ml_size >= UINT32_MAX)) {
+			type &= ~PCI_ADDR_MEM32;
+			type |= PCI_ADDR_MEM64;
+		}
 		sp->pci_phys_hi = type;
-		sp->pci_phys_mid = 0;
+		sp->pci_phys_mid = (uint32_t)(list->ml_address >> 32);
 		sp->pci_phys_low = (uint32_t)list->ml_address;
-		sp->pci_size_hi = 0;
+		sp->pci_size_hi = (uint32_t)(list->ml_size >> 32);
 		sp->pci_size_low = (uint32_t)list->ml_size;
 
 		list = list->ml_next;
