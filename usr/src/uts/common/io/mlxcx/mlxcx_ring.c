@@ -1210,6 +1210,8 @@ mlxcx_rx_ring_start(mlxcx_t *mlxp, mlxcx_ring_group_t *g,
 	ASSERT0(rq->mlwq_state & MLXCX_WQ_BUFFERS);
 	rq->mlwq_state |= MLXCX_WQ_BUFFERS;
 
+	mlxcx_shard_ready(rq->mlwq_bufs);
+
 	for (j = 0; j < rq->mlwq_nents; ++j) {
 		if (!mlxcx_buf_create(mlxp, rq->mlwq_bufs, &b))
 			break;
@@ -1405,6 +1407,9 @@ mlxcx_tx_ring_start(mlxcx_t *mlxp, mlxcx_ring_group_t *g,
 		mlxcx_buf_return(mlxp, b);
 	}
 	sq->mlwq_state |= MLXCX_WQ_BUFFERS;
+
+	mlxcx_shard_ready(sq->mlwq_bufs);
+	mlxcx_shard_ready(sq->mlwq_foreign_bufs);
 
 	if (!mlxcx_cmd_start_sq(mlxp, sq)) {
 		mutex_exit(&sq->mlwq_mtx);
@@ -1801,14 +1806,16 @@ mlxcx_rq_refill_task(void *arg)
 	mlxcx_completion_queue_t *cq = wq->mlwq_cq;
 	mlxcx_t *mlxp = wq->mlwq_mlx;
 	mlxcx_buf_shard_t *s = wq->mlwq_bufs;
-	boolean_t refill;
+	boolean_t refill, draining;
 
 	do {
 		/*
-		 * Wait until there are some free buffers.
+		 * Wait until there are some free buffers, the WQ is
+		 * shutting down or the shard is being drained.
 		 */
 		mutex_enter(&s->mlbs_mtx);
-		while (list_is_empty(&s->mlbs_free) &&
+		while (!(draining = s->mlbs_state == MLXCX_SHARD_DRAINING) &&
+		    list_is_empty(&s->mlbs_free) &&
 		    (cq->mlcq_state & MLXCX_CQ_TEARDOWN) == 0)
 			cv_wait(&s->mlbs_free_nonempty, &s->mlbs_mtx);
 		mutex_exit(&s->mlbs_mtx);
@@ -1816,7 +1823,7 @@ mlxcx_rq_refill_task(void *arg)
 		mutex_enter(&cq->mlcq_mtx);
 		mutex_enter(&wq->mlwq_mtx);
 
-		if ((cq->mlcq_state & MLXCX_CQ_TEARDOWN) != 0) {
+		if (draining || (cq->mlcq_state & MLXCX_CQ_TEARDOWN) != 0) {
 			refill = B_FALSE;
 			wq->mlwq_state &= ~MLXCX_WQ_REFILLING;
 		} else {
@@ -1853,7 +1860,10 @@ mlxcx_rq_refill(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 	target = mlwq->mlwq_nents - MLXCX_RQ_REFILL_STEP;
 	cq = mlwq->mlwq_cq;
 
-	if (cq->mlcq_state & MLXCX_CQ_TEARDOWN)
+	if ((mlwq->mlwq_state & MLXCX_WQ_STARTED) == 0)
+		return;
+
+	if ((cq->mlcq_state & MLXCX_CQ_TEARDOWN) != 0)
 		return;
 
 	current = cq->mlcq_bufcnt;
@@ -1885,7 +1895,7 @@ mlxcx_rq_refill(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 			return;
 		}
 
-		if (mlwq->mlwq_state & MLXCX_WQ_TEARDOWN) {
+		if ((mlwq->mlwq_state & MLXCX_WQ_TEARDOWN) != 0) {
 			for (i = 0; i < n; ++i)
 				mlxcx_buf_return(mlxp, b[i]);
 			return;
@@ -2060,7 +2070,6 @@ mlxcx_rx_completion(mlxcx_t *mlxp, mlxcx_completion_queue_t *mlcq,
 	wqe_index = buf->mlb_wqe_index;
 
 	if (!mlxcx_buf_loan(mlxp, buf)) {
-		mlxcx_warn(mlxp, "!loan failed, dropping packet");
 		mlxcx_buf_return(mlxp, buf);
 		return (NULL);
 	}
@@ -2103,16 +2112,11 @@ mlxcx_buf_mp_return(caddr_t arg)
 	mlxcx_buffer_t *b = (mlxcx_buffer_t *)arg;
 	mlxcx_t *mlxp = b->mlb_mlx;
 
-	if (b->mlb_state != MLXCX_BUFFER_ON_LOAN) {
-		b->mlb_mp = NULL;
-		return;
-	}
-	/*
-	 * The mblk for this buffer_t (in its mlb_mp field) has been used now,
-	 * so NULL it out.
-	 */
+	/* The mbuf has been used now, so NULL it out. */
 	b->mlb_mp = NULL;
-	mlxcx_buf_return(mlxp, b);
+
+	if (b->mlb_state == MLXCX_BUFFER_ON_LOAN)
+		mlxcx_buf_return(mlxp, b);
 }
 
 boolean_t
@@ -2179,6 +2183,11 @@ mlxcx_buf_take_foreign(mlxcx_t *mlxp, mlxcx_work_queue_t *wq)
 	mlxcx_buf_shard_t *s = wq->mlwq_foreign_bufs;
 
 	mutex_enter(&s->mlbs_mtx);
+	if (s->mlbs_state != MLXCX_SHARD_READY) {
+		mutex_exit(&s->mlbs_mtx);
+		return (NULL);
+	}
+
 	if ((b = list_remove_head(&s->mlbs_free)) != NULL) {
 		ASSERT3U(b->mlb_state, ==, MLXCX_BUFFER_FREE);
 		ASSERT(b->mlb_foreign);
@@ -2334,6 +2343,11 @@ mlxcx_buf_take(mlxcx_t *mlxp, mlxcx_work_queue_t *wq)
 	mlxcx_buf_shard_t *s = wq->mlwq_bufs;
 
 	mutex_enter(&s->mlbs_mtx);
+	if (s->mlbs_state != MLXCX_SHARD_READY) {
+		mutex_exit(&s->mlbs_mtx);
+		return (NULL);
+	}
+
 	if ((b = list_remove_head(&s->mlbs_free)) != NULL) {
 		ASSERT3U(b->mlb_state, ==, MLXCX_BUFFER_FREE);
 		b->mlb_state = MLXCX_BUFFER_ON_WQ;
@@ -2355,6 +2369,11 @@ mlxcx_buf_take_n(mlxcx_t *mlxp, mlxcx_work_queue_t *wq,
 	s = wq->mlwq_bufs;
 
 	mutex_enter(&s->mlbs_mtx);
+	if (s->mlbs_state != MLXCX_SHARD_READY) {
+		mutex_exit(&s->mlbs_mtx);
+		return (0);
+	}
+
 	while (done < nbufs && (b = list_remove_head(&s->mlbs_free)) != NULL) {
 		ASSERT3U(b->mlb_state, ==, MLXCX_BUFFER_FREE);
 		b->mlb_state = MLXCX_BUFFER_ON_WQ;
@@ -2368,6 +2387,8 @@ mlxcx_buf_take_n(mlxcx_t *mlxp, mlxcx_work_queue_t *wq,
 boolean_t
 mlxcx_buf_loan(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 {
+	mlxcx_buf_shard_t *s = b->mlb_shard;
+
 	VERIFY3U(b->mlb_state, ==, MLXCX_BUFFER_ON_WQ);
 	ASSERT3P(b->mlb_mlx, ==, mlxp);
 
@@ -2380,6 +2401,12 @@ mlxcx_buf_loan(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 
 	b->mlb_state = MLXCX_BUFFER_ON_LOAN;
 	b->mlb_wqe_index = 0;
+
+	mutex_enter(&s->mlbs_mtx);
+	list_remove(&s->mlbs_busy, b);
+	list_insert_tail(&s->mlbs_loaned, b);
+	mutex_exit(&s->mlbs_mtx);
+
 	return (B_TRUE);
 }
 
@@ -2442,7 +2469,23 @@ mlxcx_buf_return(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 		break;
 	case MLXCX_BUFFER_ON_LOAN:
 		ASSERT(!b->mlb_foreign);
-		list_remove(&s->mlbs_busy, b);
+		list_remove(&s->mlbs_loaned, b);
+		if (s->mlbs_state == MLXCX_SHARD_DRAINING) {
+			/*
+			 * When we're draining, Eg during mac_stop(),
+			 * we destroy the buffer immediately rather than
+			 * recycling it. Otherwise we risk leaving it
+			 * on the free list and leaking it.
+			 */
+			list_insert_tail(&s->mlbs_free, b);
+			mlxcx_buf_destroy(mlxp, b);
+			/*
+			 * Teardown might be waiting for loaned list to empty.
+			 */
+			cv_broadcast(&s->mlbs_free_nonempty);
+			mutex_exit(&s->mlbs_mtx);
+			return;
+		}
 		break;
 	case MLXCX_BUFFER_FREE:
 		VERIFY(0);
@@ -2455,7 +2498,7 @@ mlxcx_buf_return(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 	}
 
 	list_insert_tail(&s->mlbs_free, b);
-	cv_signal(&s->mlbs_free_nonempty);
+	cv_broadcast(&s->mlbs_free_nonempty);
 
 	mutex_exit(&s->mlbs_mtx);
 
@@ -2473,9 +2516,11 @@ void
 mlxcx_buf_destroy(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 {
 	mlxcx_buf_shard_t *s = b->mlb_shard;
+
 	VERIFY(b->mlb_state == MLXCX_BUFFER_FREE ||
 	    b->mlb_state == MLXCX_BUFFER_INIT);
 	ASSERT(mutex_owned(&s->mlbs_mtx));
+
 	if (b->mlb_state == MLXCX_BUFFER_FREE)
 		list_remove(&s->mlbs_free, b);
 
@@ -2494,4 +2539,21 @@ mlxcx_buf_destroy(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 	ASSERT(list_is_empty(&b->mlb_tx_chain));
 
 	kmem_cache_free(mlxp->mlx_bufs_cache, b);
+}
+
+void
+mlxcx_shard_ready(mlxcx_buf_shard_t *s)
+{
+	mutex_enter(&s->mlbs_mtx);
+	s->mlbs_state = MLXCX_SHARD_READY;
+	mutex_exit(&s->mlbs_mtx);
+}
+
+void
+mlxcx_shard_draining(mlxcx_buf_shard_t *s)
+{
+	mutex_enter(&s->mlbs_mtx);
+	s->mlbs_state = MLXCX_SHARD_DRAINING;
+	cv_broadcast(&s->mlbs_free_nonempty);
+	mutex_exit(&s->mlbs_mtx);
 }

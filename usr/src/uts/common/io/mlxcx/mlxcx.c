@@ -754,13 +754,19 @@ mlxcx_mlbs_teardown(mlxcx_t *mlxp, mlxcx_buf_shard_t *s)
 	mlxcx_buffer_t *buf;
 
 	mutex_enter(&s->mlbs_mtx);
+
 	while (!list_is_empty(&s->mlbs_busy))
 		cv_wait(&s->mlbs_free_nonempty, &s->mlbs_mtx);
-	while ((buf = list_head(&s->mlbs_free)) != NULL) {
+
+	while (!list_is_empty(&s->mlbs_loaned))
+		cv_wait(&s->mlbs_free_nonempty, &s->mlbs_mtx);
+
+	while ((buf = list_head(&s->mlbs_free)) != NULL)
 		mlxcx_buf_destroy(mlxp, buf);
-	}
+
 	list_destroy(&s->mlbs_free);
 	list_destroy(&s->mlbs_busy);
+	list_destroy(&s->mlbs_loaned);
 	mutex_exit(&s->mlbs_mtx);
 
 	cv_destroy(&s->mlbs_free_nonempty);
@@ -1330,6 +1336,8 @@ mlxcx_mlbs_create(mlxcx_t *mlxp)
 	list_create(&s->mlbs_busy, sizeof (mlxcx_buffer_t),
 	    offsetof(mlxcx_buffer_t, mlb_entry));
 	list_create(&s->mlbs_free, sizeof (mlxcx_buffer_t),
+	    offsetof(mlxcx_buffer_t, mlb_entry));
+	list_create(&s->mlbs_loaned, sizeof (mlxcx_buffer_t),
 	    offsetof(mlxcx_buffer_t, mlb_entry));
 	cv_init(&s->mlbs_free_nonempty, NULL, CV_DRIVER, NULL);
 
