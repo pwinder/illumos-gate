@@ -396,6 +396,7 @@ typedef struct {
 #define	NVME_LOGPAGE_ERROR	0x1	/* Error Information */
 #define	NVME_LOGPAGE_HEALTH	0x2	/* SMART/Health Information */
 #define	NVME_LOGPAGE_FWSLOT	0x3	/* Firmware Slot Information */
+#define	NVME_LOGPAGE_NSLIST	0x4	/* Changed Namespace List */
 
 typedef struct {
 	uint64_t el_count;		/* Error Count */
@@ -461,6 +462,14 @@ typedef struct {
 	char fw_frs[NVME_MAX_FWSLOTS][NVME_FWVER_SZ];
 	uint8_t fw_rsvd4[512 - 64];
 } nvme_fwslot_log_t;
+
+/*
+ * Changed namespace list log page.
+ */
+#define	NVME_CN_LIST_LIMIT	1024
+typedef struct {
+	uint32_t cn_nsid[NVME_CN_LIST_LIMIT];
+} nvme_cn_log_t;
 
 
 /*

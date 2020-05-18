@@ -328,6 +328,7 @@ typedef struct {
  */
 #define	NVME_ASYNC_TYPE_ERROR		0x0	/* Error Status */
 #define	NVME_ASYNC_TYPE_HEALTH		0x1	/* SMART/Health Status */
+#define	NVME_ASYNC_TYPE_NOTICE		0x2	/* Notice event */
 #define	NVME_ASYNC_TYPE_VENDOR		0x7	/* vendor specific */
 
 #define	NVME_ASYNC_ERROR_INV_SQ		0x0	/* Invalid Submission Queue */

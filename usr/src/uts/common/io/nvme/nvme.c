@@ -1712,6 +1712,7 @@ nvme_async_event_task(void *arg)
 	nvme_t *nvme = cmd->nc_nvme;
 	nvme_error_log_entry_t *error_log = NULL;
 	nvme_health_log_t *health_log = NULL;
+	nvme_cn_log_t *changed_ns_log = NULL;
 	size_t logsize = 0;
 	nvme_async_event_t event;
 
@@ -1855,6 +1856,18 @@ nvme_async_event_task(void *arg)
 		atomic_inc_32(&nvme->n_vendor_event);
 		break;
 
+	case NVME_ASYNC_TYPE_NOTICE:
+		if (event.b.ae_logpage == NVME_LOGPAGE_NSLIST) {
+			(void) nvme_get_logpage(nvme, B_FALSE,
+			    (void **)&changed_ns_log, &logsize,
+			    event.b.ae_logpage, -1);
+		} else {
+			dev_err(nvme->n_dip, CE_WARN, "!unexpected logpage in "
+			    "async notice event: %d", event.b.ae_logpage);
+			atomic_inc_32(&nvme->n_wrong_logpage);
+		}
+		break;
+
 	default:
 		dev_err(nvme->n_dip, CE_WARN, "!unknown async event received, "
 		    "type = %x, info = %x, logpage = %x", event.b.ae_type,
@@ -1868,6 +1881,9 @@ nvme_async_event_task(void *arg)
 
 	if (health_log)
 		kmem_free(health_log, logsize);
+
+	if (changed_ns_log)
+		kmem_free(changed_ns_log, logsize);
 }
 
 static void
