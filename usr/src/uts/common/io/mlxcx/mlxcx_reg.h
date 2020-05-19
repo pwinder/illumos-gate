@@ -2530,16 +2530,91 @@ typedef struct {
 	uint16be_t	mlrd_pplm_fec_override_admin_fdr10;
 } mlxcx_reg_pplm_t;
 
+typedef struct {
+	uint8_t		mlrd_pmlp_rxtx;
+	uint8_t		mlrd_pmlp_local_port;
+	uint8_t		mlrd_pmlp_rsvd1;
+	uint8_t		mlrd_pmlp_width;
+	uint32be_t	mlrd_pmlp_module_mapping[4];
+	uint8_t		mlrd_pmlp_rsvd2[44];
+} mlxcx_reg_pmlp_t;
+
+/* CSTYLED */
+#define	MLXCX_NVCH_ACCESS_MODE		(bitdef_t){ 22, 0x00c00000 }
+/* CSTYLED */
+#define	MLXCX_NVCH_WRITER_ID		(bitdef_t){ 16, 0x001f0000 }
+/* CSTYLED */
+#define	MLXCX_NVCH_VERSION		(bitdef_t){ 12, 0x0000f000 }
+/* CSTYLED */
+#define	MLXCX_NVCH_WRITER_HOST_ID	(bitdef_t){ 9, 0x00000e00 }
+/* CSTYLED */
+#define	MLXCX_NVCH_LENGTH		(bitdef_t){ 0, 0x000001ff }
+
 typedef enum {
+	MLXCX_NVDA_ACCESS_NEXT		= 0x0,
+	MLXCX_NVDA_ACCESS_CURRENT	= 0x1,
+	MLXCX_NVDA_ACCESS_FACTORY	= 0x2,
+} mlxcx_nvda_amode_t;
+
+typedef enum {
+	MLXCX_NV_HDR_GLOBAL_CLASS	= 0x0,
+	MLXCX_NV_HDR_PORT_CLASS		= 0x1,
+	MLXCX_NV_HDR_HOSTPF_CLASS	= 0x3,
+	MLXCX_NV_HDR_LOG_CLASS		= 0x5,
+} mlxcx_nv_hdr_class_t;
+
+typedef enum {
+	MLXCX_NV_VPI_LINK_TYPE		= 0x12,
+} mlxcx_nv_params_t;
+
+typedef union {
+	struct {
+		uint8_t		type_class;
+		uint24be_t	param_index;
+	} mlcc_global_class, mlcc_log_class;
+	struct {
+		uint8_t		type_class;
+		uint8_t		port;
+		uint16be_t	param_index;
+	} mlcc_port_class;
+	struct {
+		uint8_t		type_class;
+		uint16_t	rsvd;
+		uint8_t		param_index;
+	} mlcc_hostpf_class;
+} mlxcx_nv_conf_class_t;
+
+typedef struct {
+	bits32_t		mlch_header;
+	mlxcx_nv_conf_class_t	mlch_type;
+	uint32_t		mlch_rsvd;
+} mlxcx_nv_conf_hdr_t;
+
+typedef enum {
+	MLXCX_VPI_INFINIBAND		= 0x1,
+	MLXCX_VPI_ETHERNET		= 0x2,
+} mlxcx_vpi_link_type_t;
+
+/* CSTYLED */
+#define	MLXCX_VPI_LINK_TYPE		(bitdef_t) { 2, 0x0000000c }
+
+typedef struct {
+	mlxcx_nv_conf_hdr_t	mlvp_header;
+	bits32_t		mlvp_data;
+} mlxcx_reg_mnvda_vpi_t;
+
+typedef enum {
+	MLXCX_REG_PMLP		= 0x5002,
 	MLXCX_REG_PMTU		= 0x5003,
 	MLXCX_REG_PTYS		= 0x5004,
 	MLXCX_REG_PAOS		= 0x5006,
-	MLXCX_REG_PMAOS		= 0x5012,
-	MLXCX_REG_MSGI		= 0x9021,
-	MLXCX_REG_MLCR		= 0x902B,
-	MLXCX_REG_MCIA		= 0x9014,
 	MLXCX_REG_PPCNT		= 0x5008,
+	MLXCX_REG_PMAOS		= 0x5012,
 	MLXCX_REG_PPLM		= 0x5023,
+	MLXCX_REG_MCIA		= 0x9014,
+	MLXCX_REG_MSGI		= 0x9021,
+	MLXCX_REG_MNVDA		= 0x9024,
+	MLXCX_REG_MLCR		= 0x902B,
 } mlxcx_register_id_t;
 
 typedef union {
@@ -2551,6 +2626,8 @@ typedef union {
 	mlxcx_reg_mcia_t		mlrd_mcia;
 	mlxcx_reg_ppcnt_t		mlrd_ppcnt;
 	mlxcx_reg_pplm_t		mlrd_pplm;
+	mlxcx_reg_pmlp_t		mlrd_pmlp;
+	mlxcx_reg_mnvda_vpi_t		mlrd_mnvda;
 } mlxcx_register_data_t;
 
 typedef enum {

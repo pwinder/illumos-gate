@@ -523,7 +523,7 @@ mlxcx_cmd_queue_init(mlxcx_t *mlxp)
 		return (B_FALSE);
 	}
 
-	cmd->mcmd_mask = (uint32_t) ((1ULL << cmd->mcmd_size) - 1);
+	cmd->mcmd_mask = (uint32_t)((1ULL << cmd->mcmd_size) - 1);
 
 	mutex_init(&cmd->mcmd_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&cmd->mcmd_cv, NULL, CV_DRIVER, NULL);
@@ -1686,6 +1686,10 @@ mlxcx_reg_name(mlxcx_register_id_t rid)
 		return ("PPCNT");
 	case MLXCX_REG_PPLM:
 		return ("PPLM");
+	case MLXCX_REG_PMLP:
+		return ("PMLP");
+	case MLXCX_REG_MNVDA:
+		return ("MNVDA");
 	default:
 		return ("???");
 	}
@@ -1734,6 +1738,12 @@ mlxcx_cmd_access_register(mlxcx_t *mlxp, mlxcx_cmd_reg_opmod_t opmod,
 		break;
 	case MLXCX_REG_PPLM:
 		dsize = sizeof (mlxcx_reg_pplm_t);
+		break;
+	case MLXCX_REG_PMLP:
+		dsize = sizeof (mlxcx_reg_pmlp_t);
+		break;
+	case MLXCX_REG_MNVDA:
+		dsize = sizeof (mlxcx_reg_mnvda_vpi_t);
 		break;
 	default:
 		dsize = 0;
@@ -1996,6 +2006,94 @@ mlxcx_cmd_modify_port_fec(mlxcx_t *mlxp, mlxcx_port_t *mlp,
 	    MLXCX_REG_PPLM, &data_out);
 
 	return (ret);
+}
+
+boolean_t
+mlxcx_cmd_query_module(mlxcx_t *mlxp, mlxcx_port_t *mlp)
+{
+	mlxcx_register_data_t data;
+	mlxcx_reg_pmlp_t *pmlp;
+	boolean_t ret;
+
+	ASSERT(mutex_owned(&mlp->mlp_mtx));
+	bzero(&data, sizeof (data));
+	pmlp = &data.mlrd_pmlp;
+	pmlp->mlrd_pmlp_local_port = mlp->mlp_num + 1;
+
+	ret = mlxcx_cmd_access_register(mlxp, MLXCX_CMD_ACCESS_REGISTER_READ,
+	    MLXCX_REG_PMLP, &data);
+
+	if (!ret)
+		return (B_FALSE);
+
+	mlp->mlp_module = from_be32(pmlp->mlrd_pmlp_module_mapping[0]);
+
+	return (B_TRUE);
+}
+
+boolean_t
+mlxcx_cmd_nvquery_link_type(mlxcx_t *mlxp, mlxcx_port_t *port,
+    mlxcx_nvda_amode_t mode, mlxcx_vpi_link_type_t *vpi_type)
+{
+	mlxcx_register_data_t data;
+	mlxcx_reg_mnvda_vpi_t *mnvda;
+	boolean_t ret;
+
+	ASSERT(mutex_owned(&port->mlp_mtx));
+
+	bzero(&data, sizeof (data));
+	mnvda = &data.mlrd_mnvda;
+	mnvda->mlvp_header.mlch_type.mlcc_port_class.port =
+	    port->mlp_module + 1;
+	mnvda->mlvp_header.mlch_type.mlcc_port_class.param_index =
+	    to_be16(MLXCX_NV_VPI_LINK_TYPE);
+	mnvda->mlvp_header.mlch_type.mlcc_port_class.type_class =
+	    MLXCX_NV_HDR_PORT_CLASS;
+	set_bits32(&mnvda->mlvp_header.mlch_header, MLXCX_NVCH_LENGTH,
+	    sizeof (mnvda->mlvp_data));
+	set_bits32(&mnvda->mlvp_header.mlch_header, MLXCX_NVCH_ACCESS_MODE,
+	    mode);
+
+	ret = mlxcx_cmd_access_register(mlxp, MLXCX_CMD_ACCESS_REGISTER_READ,
+	    MLXCX_REG_MNVDA, &data);
+
+	if (ret)
+		*vpi_type = get_bits32(mnvda->mlvp_data, MLXCX_VPI_LINK_TYPE);
+
+	return (ret);
+}
+
+boolean_t
+mlxcx_cmd_nvset_link_type(mlxcx_t *mlxp, mlxcx_port_t *port,
+    mlxcx_vpi_link_type_t vpi_type)
+{
+	mlxcx_register_data_t data;
+	mlxcx_reg_mnvda_vpi_t *mnvda;
+	boolean_t ret;
+
+	ASSERT(mutex_owned(&port->mlp_mtx));
+
+	bzero(&data, sizeof (data));
+	mnvda = &data.mlrd_mnvda;
+	mnvda->mlvp_header.mlch_type.mlcc_port_class.port =
+	    port->mlp_module + 1;
+	mnvda->mlvp_header.mlch_type.mlcc_port_class.param_index =
+	    to_be16(MLXCX_NV_VPI_LINK_TYPE);
+	mnvda->mlvp_header.mlch_type.mlcc_port_class.type_class =
+	    MLXCX_NV_HDR_PORT_CLASS;
+	set_bits32(&mnvda->mlvp_header.mlch_header, MLXCX_NVCH_LENGTH,
+	    sizeof (mnvda->mlvp_data));
+	set_bits32(&mnvda->mlvp_header.mlch_header, MLXCX_NVCH_ACCESS_MODE,
+	    MLXCX_NVDA_ACCESS_NEXT);
+	set_bits32(&mnvda->mlvp_data, MLXCX_VPI_LINK_TYPE, vpi_type);
+
+	ret = mlxcx_cmd_access_register(mlxp, MLXCX_CMD_ACCESS_REGISTER_WRITE,
+	    MLXCX_REG_MNVDA, &data);
+
+	if (!ret)
+		return (B_FALSE);
+
+	return (B_TRUE);
 }
 
 boolean_t

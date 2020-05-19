@@ -965,20 +965,20 @@ mlxcx_teardown_ports(mlxcx_t *mlxp)
 
 	for (i = 0; i < mlxp->mlx_nports; ++i) {
 		p = &mlxp->mlx_ports[i];
-		if (!(p->mlp_init & MLXCX_PORT_INIT))
-			continue;
-		mutex_enter(&p->mlp_mtx);
-		if ((ft = p->mlp_rx_flow) != NULL) {
-			mutex_enter(&ft->mlft_mtx);
-			/*
-			 * teardown_flow_table() will destroy the mutex, so
-			 * we don't release it here.
-			 */
-			mlxcx_teardown_flow_table(mlxp, ft);
+		if ((p->mlp_init & MLXCX_PORT_INIT) != 0) {
+			mutex_enter(&p->mlp_mtx);
+			if ((ft = p->mlp_rx_flow) != NULL) {
+				mutex_enter(&ft->mlft_mtx);
+				/*
+				 * teardown_flow_table() will destroy the
+				 * mutex, so we don't release it here.
+				 */
+				mlxcx_teardown_flow_table(mlxp, ft);
+			}
+			mutex_exit(&p->mlp_mtx);
+			p->mlp_init &= ~MLXCX_PORT_INIT;
 		}
-		mutex_exit(&p->mlp_mtx);
 		mutex_destroy(&p->mlp_mtx);
-		p->mlp_init &= ~MLXCX_PORT_INIT;
 	}
 
 	kmem_free(mlxp->mlx_ports, mlxp->mlx_ports_size);
@@ -1761,6 +1761,8 @@ mlxcx_setup_ports(mlxcx_t *mlxp)
 	for (i = 0; i < mlxp->mlx_nports; ++i) {
 		p = &mlxp->mlx_ports[i];
 		p->mlp_num = i;
+		p->mlp_vpi_active = MLXCX_VPI_ETHERNET;
+		p->mlp_vpi_requested = MLXCX_VPI_ETHERNET;
 		p->mlp_init |= MLXCX_PORT_INIT;
 		mutex_init(&p->mlp_mtx, NULL, MUTEX_DRIVER,
 		    DDI_INTR_PRI(mlxp->mlx_intr_pri));
@@ -1783,6 +1785,10 @@ mlxcx_setup_ports(mlxcx_t *mlxp)
 		}
 		if (!mlxcx_cmd_modify_nic_vport_ctx(mlxp, p,
 		    MLXCX_MODIFY_NIC_VPORT_CTX_PROMISC)) {
+			mutex_exit(&p->mlp_mtx);
+			goto err;
+		}
+		if (!mlxcx_cmd_query_module(mlxp, p)) {
 			mutex_exit(&p->mlp_mtx);
 			goto err;
 		}
@@ -1896,6 +1902,36 @@ mlxcx_setup_ports(mlxcx_t *mlxp)
 err:
 	mlxcx_teardown_ports(mlxp);
 	return (B_FALSE);
+}
+
+static boolean_t
+mlxcx_setup_ib_ports(mlxcx_t *mlxp)
+{
+	uint_t i;
+	mlxcx_port_t *p;
+	boolean_t ret = B_TRUE;
+
+	VERIFY3U(mlxp->mlx_nports, >, 0);
+	mlxp->mlx_ports_size = mlxp->mlx_nports * sizeof (mlxcx_port_t);
+	mlxp->mlx_ports = kmem_zalloc(mlxp->mlx_ports_size, KM_SLEEP);
+
+	for (i = 0; i < mlxp->mlx_nports; ++i) {
+		p = &mlxp->mlx_ports[i];
+		p->mlp_num = i;
+		p->mlp_vpi_active = MLXCX_VPI_INFINIBAND;
+		p->mlp_vpi_requested = MLXCX_VPI_INFINIBAND;
+		mutex_init(&p->mlp_mtx, NULL, MUTEX_DRIVER,
+		    DDI_INTR_PRI(mlxp->mlx_intr_pri));
+
+		mutex_enter(&p->mlp_mtx);
+		if (!(ret = mlxcx_cmd_query_module(mlxp, p))) {
+			mutex_exit(&p->mlp_mtx);
+			break;
+		}
+		mutex_exit(&p->mlp_mtx);
+	}
+
+	return (ret);
 }
 
 void
@@ -2352,6 +2388,20 @@ mlxcx_setup_async_eqs(mlxcx_t *mlxp)
 	return (ret);
 }
 
+static boolean_t
+mlxcx_setup_ib_async_eqs(mlxcx_t *mlxp)
+{
+	boolean_t ret;
+
+	if (!mlxcx_setup_eq(mlxp, 0, 1ULL << MLXCX_EVENT_PAGE_REQUEST))
+		return (B_FALSE);
+
+	if ((ret = mlxcx_setup_eq(mlxp, 1, 1ull << MLXCX_EVENT_CMD_COMPLETION)))
+		mlxcx_cmd_eq_enable(mlxp);
+
+	return (ret);
+}
+
 int
 mlxcx_cq_compare(const void *arg0, const void *arg1)
 {
@@ -2463,12 +2513,15 @@ mlxcx_init_caps(mlxcx_t *mlxp)
 		    "(cqe_ver = %u)", (uint_t)gen->mlcap_general_cqe_version);
 		goto err;
 	}
+
+	mlxp->mlx_nports = gen->mlcap_general_num_ports;
+
 	if (gen->mlcap_general_port_type !=
 	    MLXCX_CAP_GENERAL_PORT_TYPE_ETHERNET) {
 		mlxcx_warn(mlxp, "!hardware has non-ethernet ports");
-		goto err;
+		return (B_TRUE);
 	}
-	mlxp->mlx_nports = gen->mlcap_general_num_ports;
+
 	mlxp->mlx_max_sdu = (1 << (gen->mlcap_general_log_max_msg & 0x1F));
 
 	c->mlc_max_tir = (1 << gen->mlcap_general_log_max_tir);
@@ -2591,10 +2644,28 @@ mlxcx_calc_rx_ngroups(mlxcx_t *mlxp)
 	return (ngroups);
 }
 
+static boolean_t
+mlxcx_ib_attach(mlxcx_t *mlxp)
+{
+	if (!mlxcx_setup_ib_async_eqs(mlxp))
+		return (B_FALSE);
+
+	if (!mlxcx_setup_ib_ports(mlxp))
+		return (B_FALSE);
+	mlxp->mlx_attach |= MLXCX_ATTACH_PORTS;
+
+	if (!mlxcx_register_ib_mac(mlxp))
+		return (B_FALSE);
+	mlxp->mlx_attach |= MLXCX_ATTACH_MAC_HDL;
+
+	return (B_TRUE);
+}
+
 static int
 mlxcx_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 {
 	mlxcx_t *mlxp;
+	const mlxcx_hca_cap_general_caps_t *gen;
 	char tq_name[TASKQ_NAMELEN];
 	uint_t i;
 	int inst, ret;
@@ -2701,11 +2772,27 @@ mlxcx_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	mlxp->mlx_attach |= MLXCX_ATTACH_UAR_PD_TD;
 
 	/*
-	 * Set up event queue #0 -- it's special and only handles control
-	 * type events, like PAGE_REQUEST (which we will probably get during
-	 * the commands below).
+	 * If the port is not ethernet we initialize enough to run
+	 * HCA commands and register a minimal MAC to allow us to use
+	 * utilities like dladm to change properties.
+	 */
+
+	gen = &mlxp->mlx_caps->mlc_hca_cur.mhc_general;
+	if (gen->mlcap_general_port_type !=
+	    MLXCX_CAP_GENERAL_PORT_TYPE_ETHERNET) {
+		if (!mlxcx_ib_attach(mlxp))
+			goto err;
+
+		return (DDI_SUCCESS);
+	}
+
+	/*
+	 * Set up asynchronous event queues.
+	 * #0 -- handles control type events, like PAGE_REQUEST
+	 *	 (which we will probably get during the commands below).
+	 * #1 -- handles CMD completion events.
 	 *
-	 * This will enable and arm the interrupt on EQ 0, too.
+	 * This will enable and arm the interrupt on EQs 0 and 1, too.
 	 */
 	if (!mlxcx_setup_async_eqs(mlxp)) {
 		goto err;

@@ -35,7 +35,12 @@
 
 #include <mlxcx.h>
 
+#define	MLXCX_EN_LINK_TYPE_PROP		"_en_link_type"
+#define	MLXCX_ADV_LINK_TYPE_PROP	"_adv_link_type"
+
 static char *mlxcx_priv_props[] = {
+	MLXCX_EN_LINK_TYPE_PROP,
+	MLXCX_ADV_LINK_TYPE_PROP,
 	NULL
 };
 
@@ -1108,6 +1113,15 @@ mlxcx_mac_getcapab(void *arg, mac_capab_t cap, void *cap_data)
 }
 
 static void
+mlxcx_priv_propinfo(const char *pr_name, mac_prop_info_handle_t prh)
+{
+	if (strcmp(pr_name, MLXCX_ADV_LINK_TYPE_PROP) == 0)
+		mac_prop_info_set_perm(prh, MAC_PROP_PERM_READ);
+	else if (strcmp(pr_name, MLXCX_EN_LINK_TYPE_PROP) == 0)
+		mac_prop_info_set_perm(prh, MAC_PROP_PERM_RW);
+}
+
+static void
 mlxcx_mac_propinfo(void *arg, const char *pr_name, mac_prop_id_t pr_num,
     mac_prop_info_handle_t prh)
 {
@@ -1182,11 +1196,57 @@ mlxcx_mac_propinfo(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		mac_prop_info_set_default_uint8(prh,
 		    (port->mlp_oper_proto & MLXCX_PROTO_100M) != 0);
 		break;
+	case MAC_PROP_PRIVATE:
+		mlxcx_priv_propinfo(pr_name, prh);
+		break;
 	default:
 		break;
 	}
 
 	mutex_exit(&port->mlp_mtx);
+}
+
+static const char *
+mlxcx_vpi_link_type_to_str(mlxcx_vpi_link_type_t mode)
+{
+	return (mode == MLXCX_VPI_ETHERNET ?  "eth" : "ib");
+}
+
+static int
+mlxcx_set_priv_prop(mlxcx_t *mlxp, const char *pr_name, const void *pr_val)
+{
+	mlxcx_port_t *p = &mlxp->mlx_ports[0];
+	mlxcx_vpi_link_type_t mode;
+	int ret = 0;
+
+	if (strcmp(pr_name, MLXCX_ADV_LINK_TYPE_PROP) == 0)
+		return (ENOTSUP);
+
+	if (strcmp(pr_name, MLXCX_EN_LINK_TYPE_PROP) != 0)
+		return (ENOTSUP);
+
+	if (strcmp(pr_val, "eth") == 0)
+		mode = MLXCX_VPI_ETHERNET;
+	else if (strcmp(pr_val, "ib") == 0)
+		mode = MLXCX_VPI_INFINIBAND;
+	else
+		return (EINVAL);
+
+	if (mode == p->mlp_vpi_requested)
+		return (0);
+
+	if (mlxcx_cmd_nvset_link_type(mlxp, p, mode)) {
+		mlxcx_note(mlxp, "!Link type changed from '%s' to '%s'. Change "
+		    "will only become effective after a system reset",
+		    mlxcx_vpi_link_type_to_str(p->mlp_vpi_requested),
+		    mlxcx_vpi_link_type_to_str(mode));
+
+		p->mlp_vpi_requested = mode;
+	} else {
+		ret = ENOTSUP;
+	}
+
+	return (ret);
 }
 
 static int
@@ -1288,6 +1348,10 @@ mlxcx_mac_setprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		relink = B_TRUE;
 		break;
 
+	case MAC_PROP_PRIVATE:
+		ret = mlxcx_set_priv_prop(mlxp, pr_name, pr_val);
+		break;
+
 	default:
 		ret = ENOTSUP;
 		break;
@@ -1302,6 +1366,35 @@ mlxcx_mac_setprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		}
 	}
 	mutex_exit(&port->mlp_mtx);
+
+	return (ret);
+}
+
+static int
+mlxcx_get_priv_prop(mlxcx_t *mlxp, const char *pr_name, uint_t pr_valsize,
+    void *pr_val)
+{
+	mlxcx_port_t *p = &mlxp->mlx_ports[0];
+	mlxcx_vpi_link_type_t mode;
+	int ret = 0;
+
+	if (strcmp(pr_name, MLXCX_ADV_LINK_TYPE_PROP) == 0) {
+		(void) snprintf(pr_val, pr_valsize, "%s",
+		    mlxcx_vpi_link_type_to_str(p->mlp_vpi_active));
+
+		return (0);
+	}
+
+	if (strcmp(pr_name, MLXCX_EN_LINK_TYPE_PROP) != 0)
+		return (ENOTSUP);
+
+	if (mlxcx_cmd_nvquery_link_type(mlxp, p, MLXCX_NVDA_ACCESS_CURRENT,
+	    &mode)) {
+		(void) snprintf(pr_val, pr_valsize, "%s",
+		    mlxcx_vpi_link_type_to_str(mode));
+	} else {
+		ret = EIO;
+	}
 
 	return (ret);
 }
@@ -1443,6 +1536,9 @@ mlxcx_mac_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		*(uint8_t *)pr_val = (port->mlp_max_proto &
 		    MLXCX_PROTO_100M) != 0;
 		break;
+	case MAC_PROP_PRIVATE:
+		ret = mlxcx_get_priv_prop(mlxp, pr_name, pr_valsize, pr_val);
+		break;
 	default:
 		ret = ENOTSUP;
 		break;
@@ -1451,6 +1547,173 @@ mlxcx_mac_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 	mutex_exit(&port->mlp_mtx);
 
 	return (ret);
+}
+
+/*
+ * This set of routines are enabled when the port is discovered not
+ * to be ethernet - ie is infiniband.
+ *
+ * The mostly empty routines are enough to provide access to
+ * two private properties "_en_link_type" and "_adv_link_type".
+ *
+ * They can be used to interrogate whether the existing link type is
+ * either "eth" or "ib". And if the device supports switching type
+ * "_en_link_type" can be used to set the next link type to be enabled
+ * following a hardware reset.
+ */
+static int
+mlxcx_mac_ib_stat(void *arg, uint_t stat, uint64_t *val)
+{
+	return (ENOTSUP);
+}
+
+static int
+mlxcx_mac_ib_start(void *arg)
+{
+	return (0);
+}
+
+static void
+mlxcx_mac_ib_stop(void *arg)
+{
+}
+
+static int
+mlxcx_mac_ib_setpromisc(void *arg, boolean_t on)
+{
+	return (ENOTSUP);
+}
+
+static int
+mlxcx_mac_ib_multicast(void *arg, boolean_t add, const uint8_t *addr)
+{
+	return (ENOTSUP);
+}
+
+static int
+mlxcx_mac_ib_unicst(void *arg, const uint8_t *ucaddr)
+{
+	return (ENOTSUP);
+}
+
+static int
+mlxcx_mac_ib_setprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
+    uint_t pr_valsize, const void *pr_val)
+{
+	mlxcx_t *mlxp = (mlxcx_t *)arg;
+	mlxcx_port_t *port = &mlxp->mlx_ports[0];
+	int ret;
+
+	mutex_enter(&port->mlp_mtx);
+	switch (pr_num) {
+	case MAC_PROP_PRIVATE:
+		ret = mlxcx_set_priv_prop(mlxp, pr_name, pr_val);
+		break;
+
+	default:
+		ret = ENOTSUP;
+		break;
+	}
+	mutex_exit(&port->mlp_mtx);
+
+	return (ret);
+}
+
+static int
+mlxcx_mac_ib_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
+    uint_t pr_valsize, void *pr_val)
+{
+	mlxcx_t *mlxp = (mlxcx_t *)arg;
+	mlxcx_port_t *port = &mlxp->mlx_ports[0];
+	int ret = 0;
+
+	mutex_enter(&port->mlp_mtx);
+	switch (pr_num) {
+	case MAC_PROP_STATUS:
+		if (pr_valsize < sizeof (link_state_t)) {
+			ret = EOVERFLOW;
+			break;
+		}
+		*(link_state_t *)pr_val = LINK_STATE_UNKNOWN;
+		break;
+
+	case MAC_PROP_PRIVATE:
+		ret = mlxcx_get_priv_prop(mlxp, pr_name, pr_valsize, pr_val);
+		break;
+
+	default:
+		ret = ENOTSUP;
+	}
+	mutex_exit(&port->mlp_mtx);
+
+	return (ret);
+}
+
+static void
+mlxcx_mac_ib_propinfo(void *arg, const char *pr_name, mac_prop_id_t pr_num,
+    mac_prop_info_handle_t prh)
+{
+	switch (pr_num) {
+	case MAC_PROP_PRIVATE:
+		mlxcx_priv_propinfo(pr_name, prh);
+		break;
+	default:
+		break;
+	}
+}
+
+static mblk_t *
+mlxcx_mac_ib_tx(void *arg, mblk_t *mp)
+{
+	return (mp);
+}
+
+static mac_callbacks_t mlxcx_mac_ib_callbacks = {
+	.mc_callbacks = MC_GETPROP | MC_PROPINFO | MC_SETPROP,
+	.mc_getstat = mlxcx_mac_ib_stat,
+	.mc_start = mlxcx_mac_ib_start,
+	.mc_stop = mlxcx_mac_ib_stop,
+	.mc_setpromisc = mlxcx_mac_ib_setpromisc,
+	.mc_multicst = mlxcx_mac_ib_multicast,
+	.mc_ioctl = NULL,
+	.mc_getcapab = NULL,
+	.mc_setprop = mlxcx_mac_ib_setprop,
+	.mc_getprop = mlxcx_mac_ib_getprop,
+	.mc_propinfo = mlxcx_mac_ib_propinfo,
+	.mc_tx = mlxcx_mac_ib_tx,
+	.mc_unicst = mlxcx_mac_ib_unicst,
+};
+
+boolean_t
+mlxcx_register_ib_mac(mlxcx_t *mlxp)
+{
+	mac_register_t *mac = mac_alloc(MAC_VERSION);
+	uint8_t stub_addr[ETHERADDRL] = { 0x2, 0xde, 0xad, 0xde, 0xad, 0x0 };
+	int ret;
+
+	if (mac == NULL)
+		return (B_FALSE);
+
+	stub_addr[ETHERADDRL - 1] = (uint8_t)mlxp->mlx_inst;
+
+	mac->m_type_ident = MAC_PLUGIN_IDENT_ETHER;
+	mac->m_driver = mlxp;
+	mac->m_dip = mlxp->mlx_dip;
+	mac->m_src_addr = stub_addr;
+	mac->m_callbacks = &mlxcx_mac_ib_callbacks;
+	mac->m_min_sdu = MLXCX_MTU_OFFSET;
+	mac->m_max_sdu = COMMON_IP_MTU;
+	mac->m_margin = VLAN_TAGSZ;
+	mac->m_priv_props = mlxcx_priv_props;
+	mac->m_v12n = MAC_VIRT_NONE;
+
+	ret = mac_register(mac, &mlxp->mlx_mac_hdl);
+	if (ret != 0) {
+		mlxcx_warn(mlxp, "stub mac_register() returned %d", ret);
+	}
+	mac_free(mac);
+
+	return (ret == 0);
 }
 
 #define	MLXCX_MAC_CALLBACK_FLAGS \

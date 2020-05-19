@@ -10,6 +10,7 @@
 .\"
 .\"
 .\" Copyright 2020 the University of Queensland
+.\" Copyright 2020 RackTop Systems, Inc.
 .\"
 .Dd April 9, 2020
 .Dt MLXCX 7D
@@ -55,6 +56,38 @@ The
 file contains user configurable parameters, including the ability to set the
 number of rings and groups advertised to MAC, the sizes of rings and groups,
 and the maximum number of MAC address filters available.
+.Pp
+The driver supports switching ConnectX-VPI Mellanox controllers between
+Ethernet and Infiniband link types.
+This is accomplished through the use of private
+.Xr dladm 1M
+properties, displayed and set using
+.Li show-linkprop
+and
+.Li set-linkprop
+options.
+The properties are named:
+.Bl -hang -width Ds
+.It Sy _adv_link_type
+.Bd -filled -compact
+This read-only property will show the current link type for the port.
+It will be either
+.Sy eth
+or
+.Sy ib .
+.Ed
+.It Sy _en_link_type
+.Bd -filled -compact
+.Sy _en_link_type
+is a read/write property.
+When written it sets the next link type the port will operate as, a
+change to this property is not effective until the controller has been reset.
+On read it shows what the next link type will be, valid values are
+.Sy eth
+and
+.Sy ib .
+.Ed
+.El
 .Sh PROPERTIES
 The driver supports the following device properties which may be tuned through
 its driver.conf file,

@@ -343,6 +343,7 @@ typedef struct mlxcx_port {
 	 * vport, we will probably have to change this.
 	 */
 	uint_t			mlp_num;
+	uint_t			mlp_module;
 	mlxcx_port_flags_t	mlp_flags;
 	uint64_t		mlp_guid;
 	uint8_t			mlp_mac_address[ETHERADDRL];
@@ -359,6 +360,8 @@ typedef struct mlxcx_port {
 	mlxcx_eth_proto_t	mlp_oper_proto;
 	mlxcx_pplm_fec_active_t	mlp_fec_active;
 	link_fec_t		mlp_fec_requested;
+	mlxcx_vpi_link_type_t	mlp_vpi_active;
+	mlxcx_vpi_link_type_t	mlp_vpi_requested;
 
 	mlxcx_eth_inline_mode_t	mlp_wqe_min_inline;
 
@@ -1186,6 +1189,7 @@ extern mblk_t *mlxcx_rx_poll(mlxcx_t *, mlxcx_completion_queue_t *, size_t);
  * From mlxcx_gld.c
  */
 extern boolean_t mlxcx_register_mac(mlxcx_t *);
+extern boolean_t mlxcx_register_ib_mac(mlxcx_t *);
 
 /*
  * From mlxcx_ring.c
@@ -1356,6 +1360,11 @@ extern boolean_t mlxcx_cmd_query_port_speed(mlxcx_t *, mlxcx_port_t *);
 extern boolean_t mlxcx_cmd_query_port_fec(mlxcx_t *, mlxcx_port_t *);
 extern boolean_t mlxcx_cmd_modify_port_fec(mlxcx_t *, mlxcx_port_t *,
     mlxcx_pplm_fec_caps_t);
+extern boolean_t mlxcx_cmd_query_module(mlxcx_t *, mlxcx_port_t *);
+extern boolean_t mlxcx_cmd_nvquery_link_type(mlxcx_t *, mlxcx_port_t *,
+    mlxcx_nvda_amode_t, mlxcx_vpi_link_type_t *);
+extern boolean_t mlxcx_cmd_nvset_link_type(mlxcx_t *, mlxcx_port_t *,
+    mlxcx_vpi_link_type_t);
 
 extern boolean_t mlxcx_cmd_set_port_mtu(mlxcx_t *, mlxcx_port_t *);
 
