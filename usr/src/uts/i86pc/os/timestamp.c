@@ -103,6 +103,9 @@
 
 static uint_t nsec_unscale;
 
+#define	IA32_TSC_ADJ_MSR	0x3b
+static boolean_t		tsc_re_adjusted = B_FALSE;
+
 /*
  * These two variables used to be grouped together inside of a structure that
  * lived on a single cache line. A regression (bug ID 4623398) caused the
@@ -502,7 +505,8 @@ tsc_gethrtimeunscaled_delta(void)
  * TSC Sync Master
  *
  * Typically called on the boot CPU, this attempts to quantify TSC skew between
- * different CPUs.  If an appreciable difference is found, gethrtimef will be
+ * different CPUs.  If the CPU supports TSC_ADJUST msr we'll program the msr
+ * otherwise, if an appreciable difference is found gethrtimef will be
  * changed to point to tsc_gethrtime_delta().
  *
  * Calculating skews is precise only when the master and slave TSCs are read
@@ -583,6 +587,15 @@ tsc_sync_master(processorid_t slave)
 	}
 
 	/*
+	 * If we have TSC_ADJUST feature then there is nothing further to
+	 * do here. The slave will update the adjust msr.
+	 */
+	if (is_x86_feature(x86_featureset, X86FSET_TSC_ADJUST)) {
+		restore_int_flag(flags);
+		return;
+	}
+
+	/*
 	 * Only enable the delta variants of the TSC functions if the measured
 	 * skew is greater than the fastest write time.
 	 */
@@ -618,6 +631,14 @@ tsc_sync_slave(void)
 
 	flags = clear_int_flag();
 
+	/*
+	 * Before we start, make sure the TSC_ADJUST msr is reset to 0.
+	 * Eg a fast reboot could leave residual settings, and it probably
+	 * makes sense to start everything from the same point.
+	 */
+	if (is_x86_feature(x86_featureset, X86FSET_TSC_ADJUST))
+		wrmsr(IA32_TSC_ADJ_MSR, 0);
+
 	for (cnt = 0; cnt < SYNC_ITERATIONS; cnt++) {
 		/* Re-fill the cache line */
 		s1 = tsc->master_tsc;
@@ -638,6 +659,9 @@ tsc_sync_slave(void)
 		while (tsc_sync_go != TSC_SYNC_STOP)
 			SMT_PAUSE();
 	}
+
+	if (is_x86_feature(x86_featureset, X86FSET_TSC_ADJUST))
+		wrmsr(IA32_TSC_ADJ_MSR, tsc_sync_tick_delta[CPU->cpu_id]);
 
 	restore_int_flag(flags);
 }
@@ -769,8 +793,21 @@ tsc_adjust_delta(hrtime_t tdelta)
 	int		i;
 
 	for (i = 0; i < NCPU; i++) {
-		tsc_sync_tick_delta[i] += tdelta;
+		/*
+		 * If TSC_ADJUST feature is on, the TSC_ADJUST msr will
+		 * have deltas. The msr is per CPU, so rather than
+		 * attempting to change the msr in each CPU, we reflect
+		 * the new delta in the array.
+		 */
+		if (!tsc_re_adjusted &&
+		    is_x86_feature(x86_featureset, X86FSET_TSC_ADJUST)) {
+			tsc_sync_tick_delta[i] = tdelta;
+		} else {
+			tsc_sync_tick_delta[i] += tdelta;
+		}
 	}
+
+	tsc_re_adjusted = B_TRUE;
 
 	gethrtimef = tsc_gethrtime_delta;
 	gethrtimeunscaledf = tsc_gethrtimeunscaled_delta;

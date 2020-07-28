@@ -1437,7 +1437,8 @@ static char *x86_feature_names[NUM_X86_FEATURES] = {
 	"pkg_thermal",
 	"tsx_ctrl",
 	"taa_no",
-	"ppin"
+	"ppin",
+	"tsc_adjust"
 };
 
 boolean_t
@@ -3622,6 +3623,9 @@ cpuid_pass1(cpu_t *cpu, uchar_t *featureset)
 		if (ecp->cp_ebx & CPUID_INTC_EBX_7_0_CLFLUSHOPT)
 			add_x86_feature(featureset, X86FSET_CLFLUSHOPT);
 
+		if (ecp->cp_ebx & CPUID_INTC_EBX_7_0_TSC_ADJ)
+			add_x86_feature(featureset, X86FSET_TSC_ADJUST);
+
 		if (cpi->cpi_vendor == X86_VENDOR_Intel) {
 			if (ecp->cp_ebx & CPUID_INTC_EBX_7_0_INVPCID)
 				add_x86_feature(featureset, X86FSET_INVPCID);
@@ -5231,6 +5235,8 @@ cpuid_pass4(cpu_t *cpu, uint_t *hwcap_out)
 			*ebx &= ~CPUID_INTC_EBX_7_0_RDSEED;
 		if (!is_x86_feature(x86_featureset, X86FSET_ADX))
 			*ebx &= ~CPUID_INTC_EBX_7_0_ADX;
+		if (!is_x86_feature(x86_featureset, X86FSET_TSC_ADJUST))
+			*ebx &= ~CPUID_INTC_EBX_7_0_TSC_ADJ;
 
 		/*
 		 * [no explicit support required beyond x87 fp context]
