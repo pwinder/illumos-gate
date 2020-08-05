@@ -2996,9 +2996,8 @@ done:
 
 /*
  * hubd_determine_port_connection:
- *	Determine which port is in connect status but does not
- *	have connect status change bit set, and mark port change
- *	bit accordingly.
+ *	Determine which port is in connect status, check the connect
+ *	status change bit and if appropriate, mark the port change bit.
  *	This function is applied during hub attach time.
  */
 static usb_port_mask_t
@@ -3020,6 +3019,27 @@ hubd_determine_port_connection(hubd_t	*hubd)
 		if (!(status & PORT_STATUS_CCS)) {
 
 			continue;
+		}
+
+		/*
+		 * If the hub uses "ganged" power mode it will only turn off
+		 * the power to the ports when all the ports in a
+		 * gang have been powered off.
+		 *
+		 * We have attempted to do this, followed by power on.
+		 *
+		 * It has been observed some BMC's virtual hubs have
+		 * "ganged" ports which do not transition power. In
+		 * these cases we do not seem to see an intr even though
+		 * the PORT_CHANGE_CSC bit is set, so we mark the port bit
+		 * now to ensure the port gets enumerated.
+		 */
+		if ((hubd->h_hub_chars & HUB_CHARS_POWER_SWITCHING_MODE) ==
+		    HUB_CHARS_GANGED_POWER) {
+			if (change & PORT_CHANGE_CSC) {
+				port_change |= 1 << port;
+				continue;
+			}
 		}
 
 		/*
