@@ -1404,11 +1404,13 @@ typedef struct {
 	bits16_t	mlcap_general_flags_c;
 	struct {
 #if defined(_BIT_FIELDS_HTOL)
-		uint8_t		mlcap_general_flags_d:6;
+		uint8_t		mlcap_general_port_module_event:1;
+		uint8_t		mlcap_general_flags_d:5;
 		uint8_t		mlcap_general_port_type:2;
 #elif defined(_BIT_FIELDS_LTOH)
 		uint8_t		mlcap_general_port_type:2;
-		uint8_t		mlcap_general_flags_d:6;
+		uint8_t		mlcap_general_flags_d:5;
+		uint8_t		mlcap_general_port_module_event:1;
 #endif
 	};
 	uint8_t		mlcap_general_num_ports;

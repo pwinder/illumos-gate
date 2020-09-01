@@ -2369,14 +2369,14 @@ mlxcx_setup_eq(mlxcx_t *mlxp, uint_t vec, uint64_t events)
 static boolean_t
 mlxcx_setup_async_eqs(mlxcx_t *mlxp)
 {
+	mlxcx_caps_t *caps = mlxp->mlx_caps;
 	boolean_t ret;
+	uint64_t events;
 
-	ret = mlxcx_setup_eq(mlxp, 0,
-	    (1ULL << MLXCX_EVENT_CMD_COMPLETION) |
+	events = (1ULL << MLXCX_EVENT_CMD_COMPLETION) |
 	    (1ULL << MLXCX_EVENT_PAGE_REQUEST) |
 	    (1ULL << MLXCX_EVENT_PORT_STATE) |
 	    (1ULL << MLXCX_EVENT_INTERNAL_ERROR) |
-	    (1ULL << MLXCX_EVENT_PORT_MODULE) |
 	    (1ULL << MLXCX_EVENT_SENDQ_DRAIN) |
 	    (1ULL << MLXCX_EVENT_LAST_WQE) |
 	    (1ULL << MLXCX_EVENT_CQ_ERROR) |
@@ -2384,9 +2384,12 @@ mlxcx_setup_async_eqs(mlxcx_t *mlxp)
 	    (1ULL << MLXCX_EVENT_PAGE_FAULT) |
 	    (1ULL << MLXCX_EVENT_WQ_INVALID_REQ) |
 	    (1ULL << MLXCX_EVENT_WQ_ACCESS_VIOL) |
-	    (1ULL << MLXCX_EVENT_NIC_VPORT) |
-	    (1ULL << MLXCX_EVENT_DOORBELL_CONGEST));
+	    (1ULL << MLXCX_EVENT_DOORBELL_CONGEST);
 
+	if (caps->mlc_hca_cur.mhc_general.mlcap_general_port_module_event == 1)
+		events |= 1ULL << MLXCX_EVENT_PORT_MODULE;
+
+	ret = mlxcx_setup_eq(mlxp, 0, events);
 	if (ret)
 		mlxcx_cmd_eq_enable(mlxp);
 
